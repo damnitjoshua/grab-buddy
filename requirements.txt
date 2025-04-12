@@ -3,3 +3,5 @@ google-generativeai
 SpeechRecognition
 kokoro
 sounddevice
+PyAudio
+pyttsx3

@@ -5,7 +5,10 @@ import json
 from kokoro import KPipeline
 import sounddevice as sd
 import numpy as np
-
+import pyttsx3  # Import pyttsx3 for fallback TTS
+# Corrected imports for Wav2Vec2
+from transformers import AutoProcessor, AutoModelForCTC
+import sys  # Import sys for graceful exit
 
 # --- Configuration ---
 # Removed for security to load via system variable
@@ -52,6 +55,19 @@ else:
     USE_KOKORO_TTS = True
     engine = None  # No need for pyttsx3 engine if kokoro is working
 
+# --- Initialize OpenAI Whisper for STT ---
+try:
+    whisper_processor = AutoProcessor.from_pretrained(
+        "mesolitica/wav2vec2-xls-r-300m-mixed")
+    whisper_model = AutoModelForCTC.from_pretrained(
+        "mesolitica/wav2vec2-xls-r-300m-mixed")
+    USE_WHISPER_STT = True
+    print("OpenAI Whisper STT initialized.")
+except Exception as e:
+    print(f"Error initializing OpenAI Whisper: {e}")
+    print("Falling back to Google Speech Recognition for STT.")
+    USE_WHISPER_STT = False
+
 
 # --- Text-to-Speech (TTS) ---
 def text_to_speech(text: str):
@@ -63,8 +79,8 @@ def text_to_speech(text: str):
             full_audio = np.array([], dtype=np.float32)
 
             # Using 'af_bella' voice as per example
-            # Using af_nicole voice. 'af_bella' voice
-            for _, _, audio in tts_pipeline(text, voice='zm_yunjian'):
+            # Using af_nicole voice. 'af_nicole' voice
+            for _, _, audio in tts_pipeline(text, voice='af_nicole'):
                 if audio is not None:  # audio could be None if there is an issue
                     samples = audio.shape[0]
                     if samples > 0:  # Ensure audio data is valid
@@ -111,113 +127,177 @@ def fallback_tts(text: str):
 # --- Speech-to-Text (STT) with LLM Context ---
 def speech_to_text_with_intent(context_prompt: str = "") -> Optional[Dict[str, Any]]:
     """
-    Captures audio from microphone, converts it to text, and uses LLM to get user intent in JSON format.
+    Captures audio from microphone, converts it to text using Whisper or Google STT,
+    and uses LLM to get user intent in JSON format.
     """
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("Listening...")
-        audio = r.listen(source)
+    if USE_WHISPER_STT:
+        # --- Use Whisper for STT ---
+        print("Using OpenAI Whisper for Speech Recognition...")
+        samplerate = 16000  # Whisper models were trained on 16kHz audio
+        duration = 5  # Maximum recording duration in seconds
+        print(f"Listening for {duration} seconds...")
+        recording = sd.rec(int(samplerate * duration),
+                           samplerate=samplerate, channels=1, dtype='float32')
+        sd.wait()  # Wait until recording is finished
+        audio_data = np.squeeze(recording)  # Remove single-channel dimension
 
-    try:
-        print("Recognizing...")
-        # Auto language detection by Google STT
-        query = r.recognize_google(audio)
-        print(f"User said: {query}\n")
-        user_text = query.lower()
+        input_values = whisper_processor(
+            audio_data, sampling_rate=samplerate, return_tensors="pt").input_values
+        logits = whisper_model(input_values).logits
+        predicted_ids = np.argmax(logits.detach().cpu().numpy(), axis=-1)
+        transcription = whisper_processor.batch_decode(
+            predicted_ids, skip_special_tokens=True)[0]
+
+        query = transcription
+        print(f"Whisper Transcription: {query}")
 
         if USE_GEMINI:
-            intent_prompt = f"""{context_prompt}
-            Analyze the following user text and determine the user's intent in the context of a ride booking system for a Grab driver.
-            Return a JSON object with 'intent' and optionally 'parameters'.
-            If you cannot determine the intent, set intent to 'unknown'.
+            language_prompt = f"""Identify the language of the following text.
+            The text is transcribed by a speech-to-text model that is trained on Malay, Singlish, and Mandarin primarily, but may also transcribe other languages.
+            Just return the language name. If you are unsure, return 'unknown'.
 
-            Example Response for ride selection:
-            ```json
-            {{
-              "intent": "choose_ride",
-              "parameters": {{
-                "ride_index": 1
-              }}
-            }}
-            ```
-
-            Example Response for confirmation:
-            ```json
-            {{
-              "intent": "confirm"
-            }}
-            ```
-
-            Example Response for declining:
-            ```json
-            {{
-              "intent": "decline"
-            }}
-            ```
-
-            Example Response for showing directions:
-            ```json
-            {{
-              "intent": "show_directions"
-            }}
-            ```
-
-            Example for unknown intent:
-            ```json
-            {{
-              "intent": "unknown"
-            }}
-            ```
-
-            User Text: "{user_text}"
-            JSON Response:
-            """
+            Text: "{query}"
+            Language: """
             try:
-                response = model.generate_content(intent_prompt)
-                json_string_raw = response.text  # Get raw response first
-                json_string = json_string_raw.replace("```json", "").replace(
-                    "```", "").strip()  # Remove markdown and whitespace
-                print(f"Stripped JSON String: {json_string}")  # Debug print
-                # Keep raw for comparison
-                print(f"LLM Intent JSON (Raw): {json_string_raw}")
-                # Parse JSON string to dict
-                intent_json = json.loads(json_string)
-                return intent_json
-            except json.JSONDecodeError as e:
-                print(f"JSON Decode Error: {e}, Raw response: {response.text}")
-                text_to_speech(
-                    "Sorry, I had trouble understanding your request.")
-                # Return unknown intent on json decode fail
-                return {"intent": "unknown"}
+                response = model.generate_content(language_prompt)
+                detected_language = response.text.strip()
+                print(f"Detected Language: {detected_language}")
             except Exception as e:
-                print(f"LLM Intent Error: {e}")
-                text_to_speech(
-                    "Sorry, I had trouble understanding your request.")
-                # Return unknown intent on LLM error
-                return {"intent": "unknown"}
+                print(f"Error detecting language: {e}")
+                detected_language = "unknown"  # Default to unknown on error
         else:
-            # Basic keyword-based intent for fallback if no Gemini
-            if "yes" in user_text or "confirm" in user_text or "yep" in user_text:
-                return {"intent": "confirm"}
-            elif "no" in user_text or "decline" in user_text or "nah" in user_text:
-                return {"intent": "decline"}
-            elif "directions" in user_text or "show" in user_text:
-                return {"intent": "show_directions"}
-            else:
-                # Return raw text for unknown intent
-                return {"intent": "unknown", "raw_text": user_text}
+            # If no Gemini
+            detected_language = "Language detection skipped (Gemini not enabled)."
+    else:
+        # --- Fallback to Google Speech Recognition ---
+        print("Using Google Speech Recognition...")
+        r = sr.Recognizer()
+        with sr.Microphone() as source:
+            print("Listening...")
+            audio = r.listen(source)
 
-    except sr.UnknownValueError:
-        print("Could not understand audio")
-        text_to_speech(generate_user_friendly_error(
-            "speech_recognition_unknown"))
-        return {"intent": "unknown"}
-    except sr.RequestError as e:
-        print(
-            f"Could not request results from Speech Recognition service; {e}")
-        text_to_speech(generate_user_friendly_error(
-            "speech_recognition_error"))
-        return {"intent": "error"}
+        try:
+            print("Recognizing...")
+            # Auto language detection by Google STT
+            query = r.recognize_google(audio)
+            print(f"Google STT User said: {query}\n")
+        except sr.UnknownValueError:
+            print("Could not understand audio (Google STT)")
+            # Simple error message
+            text_to_speech("Sorry, I didn't get you. Please try again.")
+            return {"intent": "unknown"}
+        except sr.RequestError as e:
+            print(
+                f"Could not request results from Speech Recognition service (Google STT); {e}")
+            # Simple error message
+            text_to_speech("Sorry, there was an issue. Please try again.")
+            return {"intent": "error"}
+        # Assume English if using Google STT as it auto-detects
+        detected_language = "English (Google STT)"
+
+    user_text = query.lower()
+
+    if USE_GEMINI:
+        intent_prompt = f"""{context_prompt}
+        Analyze the following user text and determine the user's intent in the context of a ride booking system for a Grab driver.
+        Besides ride booking intents, also consider intents related to traffic and weather information.
+        The speech-to-text model used is trained primarily on Malay, Singlish, and Mandarin, so the input text might be in one of these languages or others.
+        Return a JSON object with 'intent' and optionally 'parameters'.
+        If you cannot determine the intent, set intent to 'unknown'.
+
+        Example Response for ride selection:
+        ```json
+        {{
+          "intent": "choose_ride",
+          "parameters": {{
+            "ride_index": 1
+          }}
+        }}
+        ```
+
+        Example Response for confirmation:
+        ```json
+        {{
+          "intent": "confirm"
+        }}
+        ```
+
+        Example Response for declining:
+        ```json
+        {{
+          "intent": "decline"
+        }}
+        ```
+
+        Example Response for showing directions:
+        ```json
+        {{
+          "intent": "show_directions"
+        }}
+        ```
+        Example Response for requesting traffic information:
+        ```json
+        {{
+          "intent": "traffic_info"
+        }}
+        ```
+
+        Example Response for requesting weather information:
+        ```json
+        {{
+          "intent": "weather_info"
+        }}
+        ```
+
+
+        Example for unknown intent:
+        ```json
+        {{
+          "intent": "unknown"
+        }}
+        ```
+
+        User Text: "{user_text}"
+        JSON Response:
+        """
+        try:
+            response = model.generate_content(intent_prompt)
+            json_string_raw = response.text  # Get raw response first
+            json_string = json_string_raw.replace("```json", "").replace(
+                "```", "").strip()  # Remove markdown and whitespace
+            print(f"Stripped JSON String: {json_string}")  # Debug print
+            # Keep raw for comparison
+            print(f"LLM Intent JSON (Raw): {json_string_raw}")
+            # Parse JSON string to dict
+            intent_json = json.loads(json_string)
+            return intent_json
+        except json.JSONDecodeError as e:
+            print(f"JSON Decode Error: {e}, Raw response: {response.text}")
+            # Simple error message
+            text_to_speech("Sorry, I didn't get you. Please try again.")
+            # Return unknown intent on json decode fail
+            return {"intent": "unknown"}
+        except Exception as e:
+            print(f"LLM Intent Error: {e}")
+            # Simple error message
+            text_to_speech("Sorry, I didn't get you. Please try again.")
+            # Return unknown intent on LLM error
+            return {"intent": "unknown"}
+    else:
+        # Basic keyword-based intent for fallback if no Gemini
+        if "yes" in user_text or "confirm" in user_text or "yep" in user_text:
+            return {"intent": "confirm"}
+        elif "no" in user_text or "decline" in user_text or "nah" in user_text:
+            return {"intent": "decline"}
+        elif "directions" in user_text or "show" in user_text:
+            return {"intent": "show_directions"}
+        elif "traffic" in user_text:
+            return {"intent": "traffic_info"}
+        elif "weather" in user_text:
+            return {"intent": "weather_info"}
+        else:
+            # Return raw text for unknown intent
+            return {"intent": "unknown", "raw_text": user_text}
 
 
 # --- Gemini LLM for Enhanced Prompts and Error Handling ---
@@ -256,7 +336,7 @@ def generate_user_friendly_error(error_type: str) -> str:
         "speech_recognition_unknown": "Generate a brief and friendly message to tell the user the system did not understand the audio.  Encourage them to speak more clearly.",
         "general_error": "Provide a general, helpful error message to the user to indicate that an unexpected problem has occurred.",
         "no_rides": "Inform the driver that no rides are currently available. Apologize briefly and suggest checking again later.",
-        "ride_declined": "Acknowledge that the driver declined the ride.  Ask if there is anything else you can help with.",
+        "ride_declined": "Acknowledge that the driver declined the ride.  Inform them that you have noted their decision and will notify them of new requests.",  # Updated decline message
         "directions_declined": "Acknowledge that the driver declined to show directions. Proceed without showing directions."
         # Add other error types as needed
     }
@@ -287,6 +367,7 @@ def ask_user_to_choose_ride(ride_list: List[str]) -> Optional[str]:
     tts_prompt = generate_tts_with_llm(llm_prompt)
 
     retries = 2  # Allow up to 2 retries
+    chosen_ride = None  # Initialize outside the loop
     while retries >= 0:
         text_to_speech(tts_prompt)  # Use text_to_speech (kokoro or fallback)
         context_for_intent = "The user is choosing a ride from the following options:\n" + ride_options_text
@@ -299,22 +380,28 @@ def ask_user_to_choose_ride(ride_list: List[str]) -> Optional[str]:
                 if ride_index is not None and 1 <= ride_index <= len(ride_list):
                     chosen_ride = ride_list[ride_index - 1]
                     print(f"User chose ride: {chosen_ride}")
-                    return chosen_ride
+                    return chosen_ride  # Return immediately when ride is chosen
                 else:
                     print("Invalid ride index chosen.")
                     text_to_speech(
                         "Sorry, that is not a valid ride number. Please choose again.")
             except (KeyError, TypeError):
                 print("Error parsing ride index from intent.")
+                # Simpler retry prompt
+                text_to_speech("Sorry, please choose a ride number again.")
         elif intent_result and intent_result["intent"] == "unknown":
             if "raw_text" in intent_result:
                 print(
                     f"Unknown intent, raw user text: {intent_result['raw_text']}")
+            # Simpler retry prompt
+            text_to_speech("Sorry, I didn't get you. Please try again.")
         elif intent_result and intent_result["intent"] == "error":
             # Speech recognition error already handled in speech_to_text_with_intent
             pass  # Error message already spoken
         else:
             print(f"Unexpected intent result: {intent_result}")
+            # Simpler retry prompt
+            text_to_speech("Sorry, I missed that. Could you please try again?")
 
         # Retry if not successful
         if intent_result and intent_result["intent"] != "choose_ride":
@@ -327,15 +414,17 @@ def ask_user_to_choose_ride(ride_list: List[str]) -> Optional[str]:
                     "Sorry, I'm having trouble understanding. Let's move on.")
                 return None  # Exit after retries
         else:
-            return chosen_ride  # Exit loop if ride is chosen
+            return chosen_ride  # Return if ride is chosen
 
     return None  # Return None if all retries fail
 
 
-def read_ride_details_and_confirm(ride_details: str, weather_info: str) -> bool:
+# Removed weather_info
+def read_ride_details_and_confirm(ride_details: str) -> bool:
     """Reads ride details and confirms with retry."""
-    details_text = f"Ride details: {ride_details}. Weather information: {weather_info}."
-    llm_prompt = f"Confirm the ride details and weather with the driver. The details are: {details_text}. Ask if they want to confirm. Don't show markdown."
+    details_text = f"Ride details: {ride_details}."  # Removed weather info from text
+    # Removed weather info from prompt
+    llm_prompt = f"Confirm the ride details with the driver. The details are: {details_text}. Ask if they want to confirm. Don't show markdown."
     tts_prompt = generate_tts_with_llm(llm_prompt)
 
     retries = 2  # Allow up to 2 retries
@@ -348,17 +437,20 @@ def read_ride_details_and_confirm(ride_details: str, weather_info: str) -> bool:
         if confirmation_intent and confirmation_intent["intent"] == "confirm":
             return True
         elif confirmation_intent and confirmation_intent["intent"] == "decline":
-            text_to_speech(generate_user_friendly_error("ride_declined"))
+            text_to_speech(generate_user_friendly_error(
+                "ride_declined"))  # Uses updated decline message
             return False
         elif confirmation_intent and confirmation_intent["intent"] == "unknown":
             text_to_speech(
+                # More direct retry prompt
                 "Please confirm if you want to proceed with this ride by saying yes or no.")
         elif confirmation_intent and confirmation_intent["intent"] == "error":
             # Speech recognition error already handled in speech_to_text_with_intent
             pass  # Error message already spoken
         else:  # unexpected intent
             text_to_speech(
-                "Sorry, I didn't understand. Please confirm or decline the ride.")
+                # More direct retry prompt
+                "Sorry, I didn't understand. Please say yes to confirm or no to decline.")
 
         # Retry if not successful
         if confirmation_intent and confirmation_intent["intent"] not in ["confirm", "decline"]:
@@ -396,12 +488,14 @@ def ask_to_show_directions_and_confirm() -> bool:
             return False
         elif directions_intent and directions_intent["intent"] == "unknown":
             text_to_speech(
+                # More direct retry prompt
                 "Please say yes if you want to see directions or no to continue without directions.")
         elif directions_intent and directions_intent["intent"] == "error":
             # Speech recognition error already handled in speech_to_text_with_intent
             pass  # Error message already spoken
         else:  # unexpected intent
             text_to_speech(
+                # More direct retry prompt
                 "Sorry, I didn't understand. Please indicate if you want to show directions.")
 
         # Retry if not successful
@@ -419,9 +513,22 @@ def ask_to_show_directions_and_confirm() -> bool:
 
     return False  # Default to no directions if all retries fail
 
+# --- Helper functions for traffic and weather (stubs) ---
+
+
+def get_traffic_info():
+    """Stub function to get traffic information."""
+    # In a real application, this would fetch traffic data
+    return "Traffic is currently light."
+
+
+def get_weather_info():
+    """Stub function to get weather information."""
+    # In a real application, this would fetch weather data
+    return "The weather is sunny and 25 degrees Celsius."
+
+
 # --- Helper function to extract ride details from ride text (for testing) ---
-
-
 def get_ride_details_from_text(ride_text: str) -> str:
     """
     Extracts ride details from ride text. (Simple implementation for testing)
@@ -440,34 +547,70 @@ if __name__ == '__main__':
     try:
         pipeline = KPipeline(lang_code='a')  # kokoro time example
         # kokoro time example
-        # text_to_speech("The quick brown fox jumps over the lazy dog.")
+        text_to_speech(
+            "Hello Kokoro TTS is working")
     except RuntimeError as e:
         print(f"Kokoro TTS Pipeline likely not initialized in test.")
 
-    print("Speech Module Test:")
-
-    # Test 1: Ask user to choose a ride
+    print("Speech Module Test: (Press Ctrl+C to exit)")
     sample_rides = ["Ride to Airport at 8 AM, $25",
                     "Ride to Downtown at 9 AM, $30", "Ride to Beach at 10 AM, $35"]
-    chosen_ride_text = None
-    while chosen_ride_text is None:  # Loop until a valid ride is chosen
-        chosen_ride_text = ask_user_to_choose_ride(sample_rides)
-        if chosen_ride_text:
-            print(f"User's ride choice text: {chosen_ride_text}")
-            break  # Exit loop if valid ride is chosen
 
-    # --- UPDATED: Dynamically generate sample_ride_details ---
-    if chosen_ride_text:
+    while True:  # Main loop for continuous listening
+        chosen_ride_text = None
+        # No context prompt for main loop
+        intent_result_main = speech_to_text_with_intent()
+
+        if intent_result_main and intent_result_main["intent"] == "traffic_info":
+            traffic_info = get_traffic_info()  # Call stub function
+            text_to_speech(traffic_info)
+            continue  # Continue to next iteration of loop
+
+        elif intent_result_main and intent_result_main["intent"] == "weather_info":
+            weather_info_text = get_weather_info()  # Call stub function
+            text_to_speech(weather_info_text)
+            continue  # Continue to next iteration of loop
+
+        elif intent_result_main and intent_result_main["intent"] == "unknown":
+            print("Unknown intent in main loop.")
+            continue  # Continue to next iteration of loop
+
+        elif intent_result_main and intent_result_main["intent"] == "error":
+            print("Speech recognition error in main loop.")
+            continue  # Continue to next iteration of loop
+        elif not intent_result_main:
+            print("No intent result received in main loop.")
+            continue  # Continue to next iteration of loop
+
+        # --- Ride booking flow if not traffic/weather ---
+        while chosen_ride_text is None:  # Loop until a valid ride is chosen
+            chosen_ride_text = ask_user_to_choose_ride(sample_rides)
+            if chosen_ride_text:
+                print(f"User's ride choice text: {chosen_ride_text}")
+                break  # Exit loop if valid ride is chosen
+            else:
+                print("No ride chosen, returning to main loop.")
+                continue  # Back to main loop if no ride chosen
+
+        if not chosen_ride_text:  # In case ask_user_to_choose_ride returned None or loop continued
+            continue  # Go back to main listening loop
+
+        # --- UPDATED: Dynamically generate sample_ride_details ---
         sample_ride_details = get_ride_details_from_text(chosen_ride_text)
-    else:
-        sample_ride_details = "Ride details not available."  # Default if no ride chosen
-    sample_weather_info = "Sunny, 25 degrees Celsius"
 
-    # Test 2: Read ride details and confirm
-    ride_confirmed = read_ride_details_and_confirm(
-        sample_ride_details, sample_weather_info)
-    print(f"Ride confirmed: {ride_confirmed}")
+        # Test 2: Read ride details and confirm (weather info removed)
+        ride_confirmed = read_ride_details_and_confirm(
+            sample_ride_details)  # Removed weather_info
+        print(f"Ride confirmed: {ride_confirmed}")
 
-    # Test 3: Ask to show directions
-    show_directions = ask_to_show_directions_and_confirm()
-    print(f"Show directions: {show_directions}")
+        if not ride_confirmed:  # If ride not confirmed, go back to main loop
+            continue
+
+        # Test 3: Ask to show directions
+        show_directions = ask_to_show_directions_and_confirm()
+        print(f"Show directions: {show_directions}")
+
+        # Confirmation at end of flow
+        text_to_speech("Ride booked. Thank you!")
+        # Indicate loop restart
+        print("Ride booking flow completed. Listening for next command.\n")
