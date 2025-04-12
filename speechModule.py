@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO,
 
 # --- Configuration ---
 # Removed for security to load via system variable
-GOOGLE_API_KEY = "AIzaSyAf8HxoCsImAlgliS43dTaixkIbC6mgR7o"
+GOOGLE_API_KEY = ""
 # GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")  # Secure way, load from environment variable
 
 if not GOOGLE_API_KEY:
