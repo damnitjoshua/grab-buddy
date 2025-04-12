@@ -1,0 +1,5 @@
+numpy
+google-generativeai
+SpeechRecognition
+kokoro
+sounddevice
