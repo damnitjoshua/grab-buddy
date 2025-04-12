@@ -9,6 +9,12 @@ import pyttsx3  # Import pyttsx3 for fallback TTS
 # Corrected imports for Wav2Vec2
 from transformers import AutoProcessor, AutoModelForCTC
 import sys  # Import sys for graceful exit
+import noisereduce as nr  # Import noisereduce
+import logging  # Import logging
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Configuration ---
 # Removed for security to load via system variable
@@ -35,10 +41,8 @@ else:
             "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",
             "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     ]
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash-lite",  # Try newer model
+    model = genai.GenerativeModel(model_name="gemini-2.0-flash",  # Use flash-lite model as requested
                                   generation_config=generation_config,
                                   safety_settings=safety_settings)
 
@@ -80,7 +84,7 @@ def text_to_speech(text: str):
 
             # Using 'af_bella' voice as per example
             # Using af_nicole voice. 'af_nicole' voice
-            for _, _, audio in tts_pipeline(text, voice='af_nicole'):
+            for _, _, audio in tts_pipeline(text, voice='bf_emma'):
                 if audio is not None:  # audio could be None if there is an issue
                     samples = audio.shape[0]
                     if samples > 0:  # Ensure audio data is valid
@@ -130,19 +134,38 @@ def speech_to_text_with_intent(context_prompt: str = "") -> Optional[Dict[str, A
     Captures audio from microphone, converts it to text using Whisper or Google STT,
     and uses LLM to get user intent in JSON format.
     """
+    samplerate = 16000  # Consistent samplerate for both STT engines and noise reduction
+    duration = 5  # Maximum recording duration in seconds
+    print(f"Listening for {duration} seconds...")
+    recording = sd.rec(int(samplerate * duration),
+                       samplerate=samplerate, channels=1, dtype='float32')
+    sd.wait()  # Wait until recording is finished
+    audio_data = np.squeeze(recording)  # Remove single-channel dimension
+
+    # --- Apply Noise Reduction ---
+    try:
+        reduced_noise = nr.reduce_noise(
+            y=audio_data,
+            sr=samplerate,
+            # Example: Aggressive noise reduction (adjust this value)
+            prop_decrease=0.9,
+            time_constant_s=0.5,  # Example: Adjust time constant if needed
+            # n_std_thresh=1.5     # REMOVED n_std_thresh
+        )
+        print("Noise reduction applied.")
+        audio_for_stt = reduced_noise  # Use noise-reduced audio for STT
+
+    except Exception as e:
+        print(f"Error applying noise reduction: {e}")
+        print("Continuing without noise reduction.")
+        audio_for_stt = audio_data  # Fallback to original audio
+
     if USE_WHISPER_STT:
         # --- Use Whisper for STT ---
         print("Using OpenAI Whisper for Speech Recognition...")
-        samplerate = 16000  # Whisper models were trained on 16kHz audio
-        duration = 5  # Maximum recording duration in seconds
-        print(f"Listening for {duration} seconds...")
-        recording = sd.rec(int(samplerate * duration),
-                           samplerate=samplerate, channels=1, dtype='float32')
-        sd.wait()  # Wait until recording is finished
-        audio_data = np.squeeze(recording)  # Remove single-channel dimension
 
         input_values = whisper_processor(
-            audio_data, sampling_rate=samplerate, return_tensors="pt").input_values
+            audio_for_stt, sampling_rate=samplerate, return_tensors="pt").input_values
         logits = whisper_model(input_values).logits
         predicted_ids = np.argmax(logits.detach().cpu().numpy(), axis=-1)
         transcription = whisper_processor.batch_decode(
@@ -150,6 +173,10 @@ def speech_to_text_with_intent(context_prompt: str = "") -> Optional[Dict[str, A
 
         query = transcription
         print(f"Whisper Transcription: {query}")
+
+        if not query.strip():  # Check for empty transcription (silence)
+            print("Empty transcription (silence detected).")
+            return {"intent": "silence"}  # Return "silence" intent
 
         if USE_GEMINI:
             language_prompt = f"""Identify the language of the following text.
@@ -172,26 +199,34 @@ def speech_to_text_with_intent(context_prompt: str = "") -> Optional[Dict[str, A
         # --- Fallback to Google Speech Recognition ---
         print("Using Google Speech Recognition...")
         r = sr.Recognizer()
-        with sr.Microphone() as source:
-            print("Listening...")
-            audio = r.listen(source)
+
+        # Convert NumPy array to AudioData for Google STT
+        # Scale and convert to int16
+        audio_int16 = (audio_for_stt * 32767).astype(np.int16)
+        audio_bytes = audio_int16.tobytes()
+        audio_data_sr = sr.AudioData(
+            audio_bytes, samplerate=samplerate, sample_width=2)  # sample_width=2 for int16
 
         try:
             print("Recognizing...")
             # Auto language detection by Google STT
-            query = r.recognize_google(audio)
+            query = r.recognize_google(audio_data_sr)
             print(f"Google STT User said: {query}\n")
+
         except sr.UnknownValueError:
             print("Could not understand audio (Google STT)")
-            # Simple error message
-            text_to_speech("Sorry, I didn't get you. Please try again.")
+            # No TTS prompt here for unknown, handled in main loop
             return {"intent": "unknown"}
         except sr.RequestError as e:
             print(
                 f"Could not request results from Speech Recognition service (Google STT); {e}")
-            # Simple error message
-            text_to_speech("Sorry, there was an issue. Please try again.")
+            # No TTS prompt here for error, handled in main loop
             return {"intent": "error"}
+
+        if not query.strip():  # Check for empty transcription after Google STT
+            print("Empty transcription (silence detected).")
+            return {"intent": "silence"}  # Return "silence" intent
+
         # Assume English if using Google STT as it auto-detects
         detected_language = "English (Google STT)"
 
@@ -199,63 +234,51 @@ def speech_to_text_with_intent(context_prompt: str = "") -> Optional[Dict[str, A
 
     if USE_GEMINI:
         intent_prompt = f"""{context_prompt}
-        Analyze the following user text and determine the user's intent in the context of a ride booking system for a Grab driver.
-        Besides ride booking intents, also consider intents related to traffic and weather information.
-        The speech-to-text model used is trained primarily on Malay, Singlish, and Mandarin, so the input text might be in one of these languages or others.
+        Analyze the following user text from a Grab driver. Determine the user's intent related to ride bookings and general actions.
         Return a JSON object with 'intent' and optionally 'parameters'.
         If you cannot determine the intent, set intent to 'unknown'.
 
-        Example Response for ride selection:
+        **Key Intents:**
+
+        1.  **Show Bookings Intent:** Use this intent when the user wants to see their ride bookings OR select a specific ride from a list. Do not shorten place names.
+            - **Intent Name:** `"show_bookings"`
+            - **Sub-intents and Parameters:**
+                - **To show all bookings:** User phrases like "show me my bookings", "my bookings", "list my rides", "what are my bookings".
+                - **To select a specific ride:** User phrases like "choose number one", "number 2 please", "I want ride 3", or destination names.
+                - **Parameters:**  `"ride_index"` (integer, 1-indexed) OR `"destination"` (string, ride destination)
+
+        2.  **Confirmation Intent:** User confirms an action (e.g., confirming a ride).
+            - **Intent Name:** `"confirm"`
+            - **Example User Phrases:** "yes", "confirm", "yep", "okay", "ok", "right"
+            - **Example User Phrases (Negative - to avoid misclassification):** "what is the weather", "traffic please", "directions to somewhere"
+
+        3.  **Decline Intent:** User declines an action (e.g., declining a ride).
+            - **Intent Name:** `"decline"`
+
+        4.  **Directions Intent (General):** User requests general directions.
+            - **Intent Name:** `"directions"`
+
+        5.  **Show Directions Intent (Ride-Related):** User wants to see directions for a specific booked ride.
+            - **Intent Name:** `"show_directions"`
+
+        6.  **Traffic Info Intent:** User requests traffic information.
+            - **Intent Name:** `"traffic_info"`
+
+        7.  **Weather Info Intent:** User requests weather information.
+            - **Intent Name:** `"weather_info"`
+
+        **Combined Intent Example:** User asks for both weather and traffic.
+        If the user says "weather and traffic", return:
         ```json
         {{
-          "intent": "choose_ride",
+          "intent": "combined_info",
           "parameters": {{
-            "ride_index": 1
+            "intents": ["weather_info", "traffic_info"]
           }}
         }}
         ```
-
-        Example Response for confirmation:
-        ```json
-        {{
-          "intent": "confirm"
-        }}
-        ```
-
-        Example Response for declining:
-        ```json
-        {{
-          "intent": "decline"
-        }}
-        ```
-
-        Example Response for showing directions:
-        ```json
-        {{
-          "intent": "show_directions"
-        }}
-        ```
-        Example Response for requesting traffic information:
-        ```json
-        {{
-          "intent": "traffic_info"
-        }}
-        ```
-
-        Example Response for requesting weather information:
-        ```json
-        {{
-          "intent": "weather_info"
-        }}
-        ```
-
-
-        Example for unknown intent:
-        ```json
-        {{
-          "intent": "unknown"
-        }}
-        ```
+        If the user's text matches multiple intents, and it's not a clear combined info request, prioritize the most likely intent or return `"intent": "unknown"`.
+        If the user's text does not match any of these intents, and is not a confirmation or decline in the current context, return `"intent": "unknown"`.
 
         User Text: "{user_text}"
         JSON Response:
@@ -273,30 +296,33 @@ def speech_to_text_with_intent(context_prompt: str = "") -> Optional[Dict[str, A
             return intent_json
         except json.JSONDecodeError as e:
             print(f"JSON Decode Error: {e}, Raw response: {response.text}")
-            # Simple error message
-            text_to_speech("Sorry, I didn't get you. Please try again.")
-            # Return unknown intent on json decode fail
+            # No TTS prompt here for unknown, handled in main loop
             return {"intent": "unknown"}
         except Exception as e:
             print(f"LLM Intent Error: {e}")
-            # Simple error message
-            text_to_speech("Sorry, I didn't get you. Please try again.")
-            # Return unknown intent on LLM error
+            # No TTS prompt here for unknown, handled in main loop
             return {"intent": "unknown"}
     else:
         # Basic keyword-based intent for fallback if no Gemini
-        if "yes" in user_text or "confirm" in user_text or "yep" in user_text:
+        user_text_lower = user_text.lower()  # Lowercase once for efficiency
+        if "yes" in user_text_lower or "confirm" in user_text_lower or "yep" in user_text_lower or "okay" in user_text_lower or "ok" in user_text_lower or "right" in user_text_lower:
             return {"intent": "confirm"}
-        elif "no" in user_text or "decline" in user_text or "nah" in user_text:
+        elif "no" in user_text_lower or "decline" in user_text_lower or "nah" in user_text_lower or "cancel" in user_text_lower or "dont confirm" in user_text_lower:
             return {"intent": "decline"}
-        elif "directions" in user_text or "show" in user_text:
+        elif "directions" in user_text_lower:
+            return {"intent": "directions"}
+        elif "show directions" in user_text_lower:
             return {"intent": "show_directions"}
-        elif "traffic" in user_text:
+        elif "traffic" in user_text_lower and "weather" in user_text_lower:  # Combined intent check
+            return {"intent": "combined_info", "parameters": {"intents": ["traffic_info", "weather_info"]}}
+        elif "traffic" in user_text_lower:
             return {"intent": "traffic_info"}
-        elif "weather" in user_text:
+        elif "weather" in user_text_lower:
             return {"intent": "weather_info"}
+        # Basic ride selection by number (adjust range as needed)
+        elif user_text.isdigit() and 1 <= int(user_text) <= 3:
+            return {"intent": "show_bookings", "parameters": {"ride_index": int(user_text)}}
         else:
-            # Return raw text for unknown intent
             return {"intent": "unknown", "raw_text": user_text}
 
 
@@ -311,306 +337,461 @@ def generate_tts_with_llm(text_prompt: str) -> str:
         prompt = f"""You are an assistant for a Grab driver.  You are friendly, concise, and helpful.
         Your primary goal is to provide information to the driver using a very concise and clear tone.
         The driver needs to understand all relevant information the first time. Don't show markdown.
-        Here is the prompt: {text_prompt}"""  # Universal system prompt
+        Here is the driver's request: {text_prompt}"""
         response = model.generate_content(prompt)
         llm_generated_text = response.text
         if llm_generated_text:
             print(f"LLM generated TTS prompt: {llm_generated_text}")
+            # Check for very short affirmatives (and with punctuation)
+            if llm_generated_text.strip().lower() in ["yes", "yep", "okay", "ok", "right", "yes.", "yep.", "okay.", "ok.", "right."]:
+                print(
+                    "LLM generated a very short affirmative, using a default prompt instead.")
+                return "Please specify the ride number or destination."  # More direct prompt
             return llm_generated_text
         else:
-            print("LLM did not generate text, using basic TTS prompt.")
-            return text_prompt
+            print(
+                "LLM did not generate text, using a more informative fallback TTS prompt.")
+            return "Please specify the ride number or destination."  # Fallback to direct prompt
     except Exception as e:
         print(f"Error generating TTS prompt with LLM: {e}")
         # Log the specific error
         return text_prompt  # Fallback.
 
 
-def generate_user_friendly_error(error_type: str) -> str:
-    """Generates a user-friendly error message using Gemini"""
-    if not USE_GEMINI:
-        return "Sorry, I encountered a problem."
-
-    error_prompts = {
-        "speech_recognition_error": "Craft a brief and polite error message for the user to inform them that the speech recognition service is temporarily unavailable.  Suggest they try again later.",
-        "speech_recognition_unknown": "Generate a brief and friendly message to tell the user the system did not understand the audio.  Encourage them to speak more clearly.",
-        "general_error": "Provide a general, helpful error message to the user to indicate that an unexpected problem has occurred.",
-        "no_rides": "Inform the driver that no rides are currently available. Apologize briefly and suggest checking again later.",
-        "ride_declined": "Acknowledge that the driver declined the ride.  Inform them that you have noted their decision and will notify them of new requests.",  # Updated decline message
-        "directions_declined": "Acknowledge that the driver declined to show directions. Proceed without showing directions."
-        # Add other error types as needed
-    }
-    prompt = f"""You are an assistant providing informative and helpful messages.
-    Generate a very concise and informative user-friendly error message. The error is: {error_prompts.get(error_type, 'An unknown error occurred.')}"""  # Universal system prompt
-
-    try:
-        response = model.generate_content(prompt)
-        error_message = response.text.strip()
-        print(f"Generated error message: {error_message}")
-        return error_message
-    except Exception as e:
-        print(f"Error generating error message with Gemini: {e}")
-        return "Sorry, I encountered an error."
-
 # --- Module Functions ---
+# Modified to accept destination, default to Airport
+def show_directions(destination="Airport"):
+    """Placeholder function to show directions to a destination."""
+    tts_prompt = generate_tts_with_llm(f"Showing directions to {destination}.")
+    text_to_speech(tts_prompt)  # TTS feedback
+    # Console feedback
+    print(
+        f"Showing directions to {destination} (Placeholder). In a real app, map directions would be displayed.")
 
 
-def ask_user_to_choose_ride(ride_list: List[str]) -> Optional[str]:
-    """Asks the user to choose a ride with retry on failure."""
+# Removed is_retry parameter
+# Modified return type to include intent dict
+# Modified return type to include intent dict
+def ask_user_to_show_bookings(ride_list: List[str]) -> Optional[str or Dict[str, Any]]:
+    """Asks the user to choose a ride, handling re-selection correctly."""
     if not ride_list:
-        text_to_speech(generate_user_friendly_error("no_rides"))
+        text_to_speech("No rides available. Please check again later.")
         return None
 
     ride_options_text = "\n".join(
         [f"{i+1}. {ride}" for i, ride in enumerate(ride_list)])
-    llm_prompt = f"Ask the driver to choose one of these rides. The ride options are: {ride_options_text}."
+
+    llm_prompt = f"Ask the driver to choose a ride from the following options: {ride_options_text}."
     tts_prompt = generate_tts_with_llm(llm_prompt)
 
-    retries = 2  # Allow up to 2 retries
+    retries = 3  # Allow up to 3 retries
     chosen_ride = None  # Initialize outside the loop
-    while retries >= 0:
+    destination_to_ride_index = {}  # Map destination to ride index
+    for i, ride in enumerate(ride_list):
+        try:
+            if ride.startswith("Ride to "):
+                # Remove "Ride to " prefix
+                ride_no_prefix = ride[len("Ride to "):]
+                # Split by " from " to separate destination and origin
+                parts_from = ride_no_prefix.split(" from ")
+                if len(parts_from) > 1:  # Check if " from " exists
+                    # Take everything before " from " as destination
+                    destination = parts_from[0].strip()
+                # If no " from ", assume the rest is destination (e.g., "Ride to KLIA, RM60")
+                else:
+                    # Split by comma if no "from" and take first part
+                    destination = ride_no_prefix.split(",")[0].strip()
+
+                # Store the FULL destination as extracted, lowercase for matching
+                destination_to_ride_index[destination.lower()] = i + 1
+        except IndexError as e:
+            print(f"Error parsing ride string: {ride}, Error: {e}")
+            continue  # Skip this ride if parsing fails
+
+    while retries >= 0 and chosen_ride is None:  # Loop until a valid ride is chosen or retries expire
         text_to_speech(tts_prompt)  # Use text_to_speech (kokoro or fallback)
-        context_for_intent = "The user is choosing a ride from the following options:\n" + ride_options_text
+        context_for_intent = f"The user is choosing a ride from the following options:\n {ride_options_text}. User can say 'number one', 'number two', 'number three' or 'one', 'two', 'three' to choose the ride, or 'show bookings' to see the list again. Or user can say destination name to choose the ride by destination."
         intent_result = speech_to_text_with_intent(
             context_prompt=context_for_intent)
 
-        if intent_result and intent_result["intent"] == "choose_ride":
-            try:
-                ride_index = intent_result["parameters"].get("ride_index")
-                if ride_index is not None and 1 <= ride_index <= len(ride_list):
-                    chosen_ride = ride_list[ride_index - 1]
-                    print(f"User chose ride: {chosen_ride}")
-                    return chosen_ride  # Return immediately when ride is chosen
+        if intent_result and intent_result["intent"] == "show_bookings":
+            # Check if ride_index parameter exists
+            if "parameters" in intent_result and "ride_index" in intent_result["parameters"]:
+                try:
+                    ride_index = intent_result["parameters"].get("ride_index")
+                    if ride_index is not None and 1 <= ride_index <= len(ride_list):
+                        chosen_ride = ride_list[ride_index - 1]
+                        print(f"User chose ride number: {chosen_ride}")
+                        return chosen_ride  # Return immediately when ride is chosen
+                    else:
+                        print("Invalid ride index chosen.")
+                        text_to_speech(
+                            "Invalid ride number. Please choose from the list.")
+                except (KeyError, TypeError):
+                    print("Error parsing ride index from intent.")
+                    text_to_speech("Please choose the ride number again.")
+            elif "parameters" in intent_result and "destination" in intent_result["parameters"]:
+                chosen_destination = intent_result["parameters"].get(
+                    "destination")
+                ride_index_by_destination = destination_to_ride_index.get(
+                    chosen_destination.lower())
+                if ride_index_by_destination:
+                    chosen_ride = ride_list[ride_index_by_destination - 1]
+                    print(f"User chose ride by destination: {chosen_ride}")
+                    return chosen_ride
                 else:
-                    print("Invalid ride index chosen.")
+                    print(
+                        f"No ride found for destination: {chosen_destination}")
                     text_to_speech(
-                        "Sorry, that is not a valid ride number. Please choose again.")
-            except (KeyError, TypeError):
-                print("Error parsing ride index from intent.")
-                # Simpler retry prompt
-                text_to_speech("Sorry, please choose a ride number again.")
+                        "Sorry, I didn't find a ride for that destination. Please choose by number.")
+
+            else:
+                # User just said "show bookings" without specifying index or destination, re-prompt to choose a number
+                text_to_speech(
+                    "Please choose a ride number or destination from the list.")
+                tts_prompt = generate_tts_with_llm(
+                    "Please choose a ride number or destination from the list.")
+
         elif intent_result and intent_result["intent"] == "unknown":
             if "raw_text" in intent_result:
-                print(
-                    f"Unknown intent, raw user text: {intent_result['raw_text']}")
-            # Simpler retry prompt
-            text_to_speech("Sorry, I didn't get you. Please try again.")
+                raw_text = intent_result["raw_text"].lower()
+                print(f"Unknown intent, raw user text: {raw_text}")
+                for dest_lower, ride_index in destination_to_ride_index.items():
+                    # Exact match on lowercased destination
+                    if dest_lower == raw_text.strip():  # Check for exact match now
+                        chosen_ride = ride_list[ride_index - 1]
+                        print(
+                            f"Interpreted unknown intent as exact destination selection: {chosen_ride}")
+                        return chosen_ride
+                    # If exact match fails, you can add fuzzy matching or other logic here if needed, but for now, focusing on exact.
+            text_to_speech(
+                "Please specify the ride number or destination you're asking about.")
+
         elif intent_result and intent_result["intent"] == "error":
             # Speech recognition error already handled in speech_to_text_with_intent
-            pass  # Error message already spoken
-        else:
-            print(f"Unexpected intent result: {intent_result}")
-            # Simpler retry prompt
-            text_to_speech("Sorry, I missed that. Could you please try again?")
+            pass
+        elif intent_result and intent_result["intent"] == "silence":
+            # Do nothing, just listen again in the main loop
+            return None
+        # Edge case: ignore stray confirms/declines
+        elif intent_result and intent_result["intent"] in ["confirm", "decline"]:
+            logging.warning(
+                f"Ignoring unexpected intent in ride selection: {intent_result['intent']}")
+            tts_prompt = generate_tts_with_llm(
+                "Please choose a ride number or destination from the list.")  # Re-prompt
+        # Edge case: combined info during ride selection (though unlikely)
+        elif intent_result and intent_result["intent"] == "combined_info":
+            if "parameters" in intent_result and "intents" in intent_result["parameters"]:
+                intents = intent_result["parameters"]["intents"]
+                if "weather_info" in intents:
+                    weather_info_text = get_weather_info()
+                    weather_info_prompt = generate_tts_with_llm(
+                        weather_info_text)
+                    text_to_speech(weather_info_prompt)
+                if "traffic_info" in intents:
+                    traffic_info_text = get_traffic_info()
+                    traffic_info_prompt = generate_tts_with_llm(
+                        traffic_info_text)
+                    text_to_speech(traffic_info_prompt)
+            # tts_prompt = generate_tts_with_llm(
+            #     "Please choose a ride number or destination from the list.")  # Re-prompt after info
+        # <--- CHECK FOR UNEXPECTED INTENTS
+        elif intent_result and intent_result["intent"] not in ["show_bookings", "unknown", "error", "silence", "confirm", "decline", "combined_info"]:
+            print(
+                f"Unexpected intent during ride selection: {intent_result['intent']}")
+            return intent_result  # <--- RETURN THE INTENT DICT
+        else:  # Unexpected intent result
+            print(
+                f"Unexpected intent result during ride selection: {intent_result}")
+            text_to_speech(
+                "Please choose a ride number or destination from the list.")
+            tts_prompt = generate_tts_with_llm(
+                # Re-prompt with list context
+                "Please choose a ride number or destination from the list.")
 
-        # Retry if not successful
-        if intent_result and intent_result["intent"] != "choose_ride":
-            retries -= 1
-            if retries >= 0:
-                text_to_speech("Let's try again.")  # Prompt to try again
-            else:
-                # Give up after retries
-                text_to_speech(
-                    "Sorry, I'm having trouble understanding. Let's move on.")
-                return None  # Exit after retries
-        else:
-            return chosen_ride  # Return if ride is chosen
+        retries -= 1
+        if retries >= 0 and chosen_ride is None:  # Only re-prompt if retries left and no ride chosen
+            # If not show_bookings, then re-prompt with full list
+            if intent_result and intent_result["intent"] != "show_bookings":
+                tts_prompt = generate_tts_with_llm(
+                    "Please choose a ride from the list again.")  # Re-prompt with list context
 
-    return None  # Return None if all retries fail
+    if chosen_ride:
+        return chosen_ride
+    else:  # Ran out of retries
+        # Keep saying this if retries exhausted
+        text_to_speech("Sorry, please try again.")
+        return None  # Return None if all retries fail
 
 
-# Removed weather_info
 def read_ride_details_and_confirm(ride_details: str) -> bool:
-    """Reads ride details and confirms with retry."""
-    details_text = f"Ride details: {ride_details}."  # Removed weather info from text
-    # Removed weather info from prompt
-    llm_prompt = f"Confirm the ride details with the driver. The details are: {details_text}. Ask if they want to confirm. Don't show markdown."
+    """Reads ride details and confirms with retry. Handles weather/traffic questions during confirmation."""
+    details_text = f"Ride details: {ride_details}."
+    llm_prompt = f"Confirm these ride details: {details_text}. Ask if they want to confirm or have questions (weather/traffic)."
     tts_prompt = generate_tts_with_llm(llm_prompt)
 
-    retries = 2  # Allow up to 2 retries
-    while retries >= 0:
-        text_to_speech(tts_prompt)  # Use text_to_speech (kokoro or fallback)
-        context_for_confirmation = "The user is being asked to confirm ride details."
+    retries = 2
+    confirmed = False
+    while retries >= 0 and not confirmed:
+        text_to_speech(tts_prompt)
         confirmation_intent = speech_to_text_with_intent(
-            context_prompt=context_for_confirmation)
+            context_prompt=llm_prompt)
 
         if confirmation_intent and confirmation_intent["intent"] == "confirm":
-            return True
+            confirmed = True
+            break
         elif confirmation_intent and confirmation_intent["intent"] == "decline":
-            text_to_speech(generate_user_friendly_error(
-                "ride_declined"))  # Uses updated decline message
+            text_to_speech("Ride declined.")
             return False
+        elif confirmation_intent and confirmation_intent["intent"] == "silence":
+            pass
         elif confirmation_intent and confirmation_intent["intent"] == "unknown":
             text_to_speech(
-                # More direct retry prompt
-                "Please confirm if you want to proceed with this ride by saying yes or no.")
+                "Please say yes/no to confirm, or ask weather/traffic.")
         elif confirmation_intent and confirmation_intent["intent"] == "error":
-            # Speech recognition error already handled in speech_to_text_with_intent
-            pass  # Error message already spoken
-        else:  # unexpected intent
-            text_to_speech(
-                # More direct retry prompt
-                "Sorry, I didn't understand. Please say yes to confirm or no to decline.")
-
-        # Retry if not successful
-        if confirmation_intent and confirmation_intent["intent"] not in ["confirm", "decline"]:
-            retries -= 1
-            if retries >= 0:
-                text_to_speech("Let's try again.")  # Prompt to try again
-            else:
-                # Give up after retries, skip confirmation
-                text_to_speech("Okay, we will skip ride confirmation.")
-                return False  # Default to not confirmed after retries
+            pass
+        elif confirmation_intent and confirmation_intent["intent"] == "weather_info":
+            weather_info_text = get_weather_info()
+            weather_info_prompt = generate_tts_with_llm(weather_info_text)
+            text_to_speech(weather_info_prompt)
+            # tts_prompt = generate_tts_with_llm(
+            #     "Do you want to confirm the ride?")  # Re-prompt
+        elif confirmation_intent and confirmation_intent["intent"] == "traffic_info":
+            traffic_info_text = get_traffic_info()
+            traffic_info_prompt = generate_tts_with_llm(traffic_info_text)
+            text_to_speech(traffic_info_prompt)
+            # tts_prompt = generate_tts_with_llm(
+            #     "Do you want to confirm the ride?")  # Re-prompt
+        # Handle combined info request
+        elif confirmation_intent and confirmation_intent["intent"] == "combined_info":
+            if "parameters" in confirmation_intent and "intents" in confirmation_intent["parameters"]:
+                intents = confirmation_intent["parameters"]["intents"]
+                if "weather_info" in intents:
+                    weather_info_text = get_weather_info()
+                    weather_info_prompt = generate_tts_with_llm(
+                        weather_info_text)
+                    text_to_speech(weather_info_prompt)
+                if "traffic_info" in intents:
+                    traffic_info_text = get_traffic_info()
+                    traffic_info_prompt = generate_tts_with_llm(
+                        traffic_info_text)
+                    text_to_speech(traffic_info_prompt)
+            # tts_prompt = generate_tts_with_llm(
+            #     "Do you want to confirm the ride?")  # Re-prompt after combined info
         else:
-            # Exit loop if confirmed or declined
-            return confirmation_intent["intent"] == "confirm"
+            text_to_speech(
+                "Please say yes/no to confirm, or ask weather/traffic.")
 
-    return False  # Default to not confirmed if all retries fail
+        retries -= 1
+        if retries >= 0 and not confirmed:
+            tts_prompt_retry = generate_tts_with_llm(
+                "Confirm again: yes/no, or ask weather/traffic.")
+            text_to_speech(tts_prompt_retry)
+        elif retries < 0 and not confirmed:
+            text_to_speech("Sorry, please try again later.")
+            return False
+
+    return confirmed
 
 
 def ask_to_show_directions_and_confirm() -> bool:
     """Asks to show directions and confirms with retry."""
-    llm_prompt = "Ask the driver if they want to show directions."
+    llm_prompt = "Ask the user if they want to see directions for their ride. Phrase it as a clear yes/no question."  # More specific prompt
     tts_prompt = generate_tts_with_llm(llm_prompt)
 
-    retries = 2  # Allow up to 2 retries
-    while retries >= 0:
-        text_to_speech(tts_prompt)  # Use text_to_speech (kokoro or fallback)
-        context_for_directions = "The user is being asked if they want to show directions."
+    retries = 2
+    show_directions_confirmed = False
+    while retries >= 0 and not show_directions_confirmed:
+        text_to_speech(tts_prompt)
+        context_for_directions = "Ask user if they want to show directions (yes/no)."
         directions_intent = speech_to_text_with_intent(
             context_prompt=context_for_directions)
 
         if directions_intent and directions_intent["intent"] == "show_directions":
-            text_to_speech("Showing directions")
-            return True
+            # show_directions()
+            show_directions_confirmed = True
+            break
         elif directions_intent and directions_intent["intent"] == "decline":
-            text_to_speech(generate_user_friendly_error("directions_declined"))
+            text_to_speech("Directions declined.")
             return False
+        elif directions_intent and directions_intent["intent"] == "silence":
+            pass
         elif directions_intent and directions_intent["intent"] == "unknown":
             text_to_speech(
-                # More direct retry prompt
-                "Please say yes if you want to see directions or no to continue without directions.")
+                "Do you want to see directions? Please say yes/no.")
         elif directions_intent and directions_intent["intent"] == "error":
-            # Speech recognition error already handled in speech_to_text_with_intent
-            pass  # Error message already spoken
-        else:  # unexpected intent
-            text_to_speech(
-                # More direct retry prompt
-                "Sorry, I didn't understand. Please indicate if you want to show directions.")
-
-        # Retry if not successful
-        if directions_intent and directions_intent["intent"] not in ["show_directions", "decline"]:
-            retries -= 1
-            if retries >= 0:
-                text_to_speech("Let's try again.")  # Prompt to try again
-            else:
-                # Give up after retries, skip directions
-                text_to_speech("Okay, proceeding without showing directions.")
-                return False  # Default to no directions after retries
+            pass
         else:
-            # Exit loop if show_directions or declined
-            return directions_intent["intent"] == "show_directions"
+            text_to_speech(
+                "Do you want to see directions? Please say yes/no.")
 
-    return False  # Default to no directions if all retries fail
+        retries -= 1
+        if retries >= 0 and not show_directions_confirmed:
+            tts_prompt_retry = generate_tts_with_llm(
+                "Again: Do you want to see directions?")
+            text_to_speech(tts_prompt_retry)
+        elif retries < 0 and not show_directions_confirmed:
+            text_to_speech("Sorry, please try again later.")
+            return False
 
-# --- Helper functions for traffic and weather (stubs) ---
+    return show_directions_confirmed
 
 
 def get_traffic_info():
     """Stub function to get traffic information."""
-    # In a real application, this would fetch traffic data
     return "Traffic is currently light."
 
 
 def get_weather_info():
     """Stub function to get weather information."""
-    # In a real application, this would fetch weather data
     return "The weather is sunny and 25 degrees Celsius."
 
 
-# --- Helper function to extract ride details from ride text (for testing) ---
 def get_ride_details_from_text(ride_text: str) -> str:
-    """
-    Extracts ride details from ride text. (Simple implementation for testing)
-    In real app, you would likely fetch details from a structured source.
-    """
+    """Extracts ride details from ride text."""
     parts = ride_text.split(", ")
     if len(parts) >= 2:
-        destination = parts[0].replace("Ride to ", "")  # e.g., "Airport"
-        time = parts[1]  # e.g., "8 AM"
-        # Basic details
-        return f"Ride to {destination}, Driver: John, Car: Sedan, ETA: {time}"
-    return "Ride details not available."  # Default if parsing fails
+        destination = parts[0].replace("Ride to ", "")
+        time = parts[1]
+        return f"Ride to {destination}, Price: {time}"
+    return "Ride details not available."
 
 
 if __name__ == '__main__':
     try:
-        pipeline = KPipeline(lang_code='a')  # kokoro time example
-        # kokoro time example
-        text_to_speech(
-            "Hello Kokoro TTS is working")
+        pipeline = KPipeline(lang_code='a')
+        initial_greeting_prompt = generate_tts_with_llm(
+            "Hello this is Grab Buddy! How can I help you?")
+        text_to_speech(initial_greeting_prompt)
     except RuntimeError as e:
         print(f"Kokoro TTS Pipeline likely not initialized in test.")
 
-    print("Speech Module Test: (Press Ctrl+C to exit)")
-    sample_rides = ["Ride to Airport at 8 AM, $25",
-                    "Ride to Downtown at 9 AM, $30", "Ride to Beach at 10 AM, $35"]
+    print("Grab Driver Buddy Ready! (Ctrl+C to exit)")
+    sample_rides = ["Ride to Sunway Universiti from Universiti Tower, RM10",
+                    "Ride to KLIA from KLCC, RM60", "Ride to Monash from Sunway Universiti, RM35"]
 
-    while True:  # Main loop for continuous listening
+    last_chosen_destination = None
+    ride_confirmed = False
+
+    while True:
         chosen_ride_text = None
-        # No context prompt for main loop
+        unexpected_intent_result = None
         intent_result_main = speech_to_text_with_intent()
 
         if intent_result_main and intent_result_main["intent"] == "traffic_info":
-            traffic_info = get_traffic_info()  # Call stub function
-            text_to_speech(traffic_info)
-            continue  # Continue to next iteration of loop
+            traffic_info = get_traffic_info()
+            traffic_info_prompt = generate_tts_with_llm(traffic_info)
+            text_to_speech(traffic_info_prompt)
+            continue
 
         elif intent_result_main and intent_result_main["intent"] == "weather_info":
-            weather_info_text = get_weather_info()  # Call stub function
-            text_to_speech(weather_info_text)
-            continue  # Continue to next iteration of loop
+            weather_info_text = get_weather_info()
+            weather_info_prompt = generate_tts_with_llm(weather_info_text)
+            text_to_speech(weather_info_prompt)
+            continue
+        # Handle combined info in main loop
+        elif intent_result_main and intent_result_main["intent"] == "combined_info":
+            if "parameters" in intent_result_main and "intents" in intent_result_main["parameters"]:
+                intents = intent_result_main["parameters"]["intents"]
+                if "weather_info" in intents:
+                    weather_info_text = get_weather_info()
+                    weather_info_prompt = generate_tts_with_llm(
+                        weather_info_text)
+                    text_to_speech(weather_info_prompt)
+                if "traffic_info" in intents:
+                    traffic_info_text = get_traffic_info()
+                    traffic_info_prompt = generate_tts_with_llm(
+                        traffic_info_text)
+                    text_to_speech(traffic_info_prompt)
+            continue  # Continue to next iteration after providing info
+
+        elif intent_result_main and intent_result_main["intent"] == "directions":
+            destination_for_directions = last_chosen_destination if last_chosen_destination else "Universiti Malaya Faculty of Computer Science"
+            show_directions(destination=destination_for_directions)
+            continue
 
         elif intent_result_main and intent_result_main["intent"] == "unknown":
             print("Unknown intent in main loop.")
-            continue  # Continue to next iteration of loop
+            unknown_prompt = generate_tts_with_llm(
+                # Changed to specify prompt directly
+                "Please specify the ride number or destination you're asking about.")
+            # text_to_speech(unknown_prompt)
+            continue
 
         elif intent_result_main and intent_result_main["intent"] == "error":
             print("Speech recognition error in main loop.")
-            continue  # Continue to next iteration of loop
+            continue
+        elif intent_result_main and intent_result_main["intent"] == "silence":
+            print("Silence detected, listening again...")
+            continue
+        # Edge case handling in main loop
+        elif intent_result_main and intent_result_main["intent"] in ["confirm", "decline"]:
+            logging.warning(
+                f"Ignoring unexpected intent in main loop: {intent_result_main['intent']}")
+            continue  # Ignore stray confirms/declines in main loop
+
         elif not intent_result_main:
             print("No intent result received in main loop.")
-            continue  # Continue to next iteration of loop
-
-        # --- Ride booking flow if not traffic/weather ---
-        while chosen_ride_text is None:  # Loop until a valid ride is chosen
-            chosen_ride_text = ask_user_to_choose_ride(sample_rides)
-            if chosen_ride_text:
-                print(f"User's ride choice text: {chosen_ride_text}")
-                break  # Exit loop if valid ride is chosen
-            else:
-                print("No ride chosen, returning to main loop.")
-                continue  # Back to main loop if no ride chosen
-
-        if not chosen_ride_text:  # In case ask_user_to_choose_ride returned None or loop continued
-            continue  # Go back to main listening loop
-
-        # --- UPDATED: Dynamically generate sample_ride_details ---
-        sample_ride_details = get_ride_details_from_text(chosen_ride_text)
-
-        # Test 2: Read ride details and confirm (weather info removed)
-        ride_confirmed = read_ride_details_and_confirm(
-            sample_ride_details)  # Removed weather_info
-        print(f"Ride confirmed: {ride_confirmed}")
-
-        if not ride_confirmed:  # If ride not confirmed, go back to main loop
             continue
 
-        # Test 3: Ask to show directions
-        show_directions = ask_to_show_directions_and_confirm()
-        print(f"Show directions: {show_directions}")
+        ride_confirmed = False
+        while chosen_ride_text is None and unexpected_intent_result is None:
+            booking_result = ask_user_to_show_bookings(
+                sample_rides)
+            if isinstance(booking_result, dict):
+                unexpected_intent_result = booking_result
+                break
+            else:
+                chosen_ride_text = booking_result
 
-        # Confirmation at end of flow
-        text_to_speech("Ride booked. Thank you!")
-        # Indicate loop restart
+            if chosen_ride_text:
+                print(f"User's ride choice text: {chosen_ride_text}")
+                last_chosen_destination = chosen_ride_text.split(" to ")[1].split(
+                    ",")[0]
+                break
+            else:
+                print("No ride chosen, returning to main loop.")
+                continue
+
+        if unexpected_intent_result:
+            if unexpected_intent_result["intent"] == "weather_info":
+                weather_info_text = get_weather_info()
+                weather_info_prompt = generate_tts_with_llm(weather_info_text)
+                text_to_speech(weather_info_prompt)
+                continue
+            elif unexpected_intent_result["intent"] == "traffic_info":
+                traffic_info = get_traffic_info()
+                traffic_info_prompt = generate_tts_with_llm(traffic_info)
+                text_to_speech(traffic_info_prompt)
+                continue
+            elif unexpected_intent_result["intent"] == "directions":
+                destination_for_directions = last_chosen_destination if last_chosen_destination else "Universiti Malaya Faculty of Computer Science"
+                show_directions(destination=destination_for_directions)
+                continue
+            else:
+                print(
+                    f"Unhandled unexpected intent: {unexpected_intent_result['intent']}")
+                text_to_speech("Sorry, I cannot do that right now.")
+                continue
+
+        if not chosen_ride_text:
+            continue
+
+        sample_ride_details = get_ride_details_from_text(chosen_ride_text)
+        ride_confirmed = read_ride_details_and_confirm(
+            sample_ride_details)
+        print(f"Ride confirmed: {ride_confirmed}")
+
+        if not ride_confirmed:
+            continue
+
+        show_directions_for_ride = ask_to_show_directions_and_confirm()
+        print(f"Show directions (ride related): {show_directions_for_ride}")
+
+        # if show_directions_for_ride:
+        #     show_directions()
+
+        final_confirmation_prompt = generate_tts_with_llm(
+            "Ride booked. Thank you!")
+        text_to_speech(final_confirmation_prompt)
         print("Ride booking flow completed. Listening for next command.\n")

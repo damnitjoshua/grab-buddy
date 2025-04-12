@@ -5,3 +5,4 @@ kokoro
 sounddevice
 PyAudio
 pyttsx3
+noisereduce
