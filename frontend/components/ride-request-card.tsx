@@ -1,5 +1,7 @@
 "use client"
 import { useState, useEffect, useRef } from "react"
+import type React from "react"
+
 import type { QueuedRide } from "@/lib/types"
 import { Navigation, DollarSign, Clock, ChevronLeft, ChevronRight } from "lucide-react"
 
@@ -33,15 +35,15 @@ export default function RideRequestCard({
     // Reset animation when switching between rides
     if (rideIdRef.current !== ride.id) {
       rideIdRef.current = ride.id
-      
+
       const requestAge = new Date().getTime() - ride.timestamp.getTime()
       const isOld = requestAge > 20000 // 20 seconds
       const remainingTime = Math.max(0, 30000 - requestAge)
       const initialProgress = Math.min(100, (requestAge / 30000) * 100)
-      
+
       setProgressStyle({
         width: `${initialProgress}%`,
-        animation: `progress ${remainingTime / 1000}s linear forwards`
+        animation: `progress ${remainingTime / 1000}s linear forwards`,
       })
     }
   }, [ride.id, ride.timestamp])

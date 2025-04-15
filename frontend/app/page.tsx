@@ -9,8 +9,10 @@ import QueuedRidesPanel from "@/components/queued-rides-panel"
 import NotificationFab from "@/components/notification-fab"
 import RideConfirmationModal from "@/components/ride-confirmation-modal"
 import PendingRequestsAfterRidePanel from "@/components/pending-requests-after-ride-panel"
+import VoiceCommandIndicator from "@/components/voice-command-indicator"
 import { RideStatus } from "@/lib/types"
 import { useDriverState } from "@/lib/driver-state"
+import { useVoiceCommands } from "@/lib/use-voice-commands"
 
 // Dynamically import the Map component with SSR disabled
 const DynamicMap = dynamic(() => import("@/components/map"), {
@@ -51,12 +53,34 @@ export default function Home() {
     viewQueuedRide,
   } = useDriverState()
 
+  // Initialize voice commands
+  const { isSupported, isListeningForWakeWord, isVoiceCommandActive, lastCommand, error, activateVoiceCommands } =
+    useVoiceCommands({
+      driverStatus,
+      rideStatus,
+      toggleDriverStatus,
+      acceptRide,
+      declineRide,
+      startRide,
+      endRide,
+      toggleQueuedRidesPanel,
+    })
+
   return (
     <main className="relative h-screen w-full overflow-hidden">
       {/* Use the dynamically imported Map component */}
       <DynamicMap driverStatus={driverStatus} rideStatus={rideStatus} currentRide={currentRide} />
 
       <StatusBar driverStatus={driverStatus} />
+
+      {/* Voice Command Indicator */}
+      <VoiceCommandIndicator
+        isListeningForWakeWord={isListeningForWakeWord}
+        isVoiceCommandActive={isVoiceCommandActive}
+        lastCommand={lastCommand}
+        error={error}
+        onActivate={activateVoiceCommands}
+      />
 
       {/* Notification FAB for queued rides - only show during active rides */}
       {(rideStatus === RideStatus.ACCEPTED ||

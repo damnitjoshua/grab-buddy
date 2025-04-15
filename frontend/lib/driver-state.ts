@@ -198,21 +198,18 @@ export function useDriverState() {
       setDriverStatus(DriverStatus.ONLINE)
       setRideStatus(RideStatus.IDLE)
 
-      // Add a 2-second delay before generating the first ride request
-      const timer = setTimeout(() => {
-        const newRide = generateMockRide()
-        setRideRequests([{ ...newRide, status: "pending", timestamp: new Date() }])
-        setCurrentRide(newRide)
-        setRideStatus(RideStatus.REQUESTED)
+      const newRide = generateMockRide()
+      setRideRequests([{ ...newRide, status: "pending", timestamp: new Date() }])
+      setCurrentRide(newRide)
+      setRideStatus(RideStatus.REQUESTED)
 
-        // Announce the new ride with TTS
-        const ttsText = `New ride request from ${newRide.passengerName}. Pickup at ${newRide.pickupLocation.address}. Estimated fare: ${newRide.fare.toFixed(2)} dollars.`
-        speak(ttsText)
+      // Announce the new ride with TTS
+      const ttsText = `New ride request from ${newRide.passengerName}. Pickup at ${newRide.pickupLocation.address}. Estimated fare: ${newRide.fare.toFixed(2)} dollars.`
+      speak(ttsText)
 
-        // Schedule next requests with longer delay
-        const nextTimer = setTimeout(generateNewRideRequest, 10000 + Math.random() * 10000) // 10-20 seconds
-        setRequestTimer(nextTimer)
-      }, 2000) // 2-second delay
+      // Schedule next requests with longer delay
+      const nextTimer = setTimeout(generateNewRideRequest, 10000 + Math.random() * 10000) // 10-20 seconds
+      setRequestTimer(nextTimer)
 
       setRequestTimer(timer)
     } else {
