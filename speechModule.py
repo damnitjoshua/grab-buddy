@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO,
 
 # --- Configuration ---
 # Removed for security to load via system variable
-GOOGLE_API_KEY = ""
+GOOGLE_API_KEY = "AIzaSyAf8HxoCsImAlgliS43dTaixkIbC6mgR7o"
 # GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")  # Secure way, load from environment variable
 
 if not GOOGLE_API_KEY:
@@ -42,7 +42,7 @@ else:
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",
             "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     ]
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash",  # Use flash-lite model as requested
+    model = genai.GenerativeModel(model_name="gemini-2.0-flash-lite",  # Use flash-lite model as requested
                                   generation_config=generation_config,
                                   safety_settings=safety_settings)
 
