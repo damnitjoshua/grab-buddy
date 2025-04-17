@@ -8,7 +8,7 @@ const inter = Inter({ subsets: ["latin"] })
 export const metadata: Metadata = {
   title: "GrabDriver - Hackathon Prototype",
   description: "A Grab-style driver app interface for a hackathon prototype",
-    generator: 'v0.dev'
+  generator: "v0.dev",
 }
 
 export default function RootLayout({
@@ -22,6 +22,8 @@ export default function RootLayout({
     </html>
   )
 }
+
+import "./globals.css"
 
 
 import './globals.css'
