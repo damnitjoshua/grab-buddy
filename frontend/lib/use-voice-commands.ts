@@ -1,35 +1,22 @@
-"use client"
+"use client";
 
-import { useState, useEffect, useCallback, useRef } from "react"
-import { DriverStatus, type RideStatus } from "./types"
+import { useState, useEffect, useCallback, useRef } from "react";
+import { DriverStatus, type RideStatus } from "./types";
 
-// Define the available voice commands
-type VoiceCommand =
-  | "go online"
-  | "go offline"
-  | "accept ride"
-  | "decline ride"
-  | "arrived at pickup"
-  | "start ride"
-  | "end ride"
-  | "view requests"
-  | "cancel"
-
-// Define the props for the hook
 interface UseVoiceCommandsProps {
-  driverStatus: DriverStatus
-  rideStatus: RideStatus
-  toggleDriverStatus: () => void
-  acceptRide: () => void
-  declineRide: () => void
-  startRide: () => void
-  endRide: () => void
-  toggleQueuedRidesPanel: () => void
+  driverStatus: DriverStatus;
+  rideStatus: RideStatus;
+  toggleDriverStatus: () => void;
+  acceptRide: () => void;
+  declineRide: () => void;
+  startRide: () => void;
+  endRide: () => void;
+  toggleQueuedRidesPanel: () => void;
+  onVoiceCommand: (transcript: string) => void;
 }
 
-// Declare SpeechRecognition
-declare var SpeechRecognition: any
-declare var webkitSpeechRecognition: any
+declare var SpeechRecognition: any;
+declare var webkitSpeechRecognition: any;
 
 export function useVoiceCommands({
   driverStatus,
@@ -40,270 +27,221 @@ export function useVoiceCommands({
   startRide,
   endRide,
   toggleQueuedRidesPanel,
+  onVoiceCommand,
 }: UseVoiceCommandsProps) {
-  // State for tracking if voice recognition is supported
-  const [isSupported, setIsSupported] = useState(false)
+  const [isSupported, setIsSupported] = useState(false);
+  const [isListeningForWakeWord, setIsListeningForWakeWord] = useState(false);
+  const [isVoiceCommandActive, setIsVoiceCommandActive] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // State for tracking if we're listening for the wake word
-  const [isListeningForWakeWord, setIsListeningForWakeWord] = useState(false)
+  const wakeWordRecognitionRef = useRef<SpeechRecognition | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null); // (not used anymore)
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const websocketRef = useRef<WebSocket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null); // 🟩 NEW
 
-  // State for tracking if voice commands are active (after wake word detected)
-  const [isVoiceCommandActive, setIsVoiceCommandActive] = useState(false)
-
-  // State for tracking the last recognized command
-  const [lastCommand, setLastCommand] = useState<string>("")
-
-  // State for tracking error messages
-  const [error, setError] = useState<string | null>(null)
-
-  // Refs for the speech recognition instances
-  const wakeWordRecognitionRef = useRef<SpeechRecognition | null>(null)
-  const commandRecognitionRef = useRef<SpeechRecognition | null>(null)
-
-  // Initialize speech recognition
   useEffect(() => {
-    // Check if the browser supports the Web Speech API
-    if (typeof window !== "undefined" && ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)) {
-      setIsSupported(true)
+    if (
+      typeof window !== "undefined" &&
+      ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)
+    ) {
+      setIsSupported(true);
+      const SpeechRecognition =
+        window.SpeechRecognition || webkitSpeechRecognition;
 
-      // Create the SpeechRecognition instances
-      const SpeechRecognition = window.SpeechRecognition || webkitSpeechRecognition
+      wakeWordRecognitionRef.current = new SpeechRecognition();
+      wakeWordRecognitionRef.current.continuous = true;
+      wakeWordRecognitionRef.current.interimResults = false;
 
-      // Initialize wake word recognition
-      wakeWordRecognitionRef.current = new SpeechRecognition()
-      wakeWordRecognitionRef.current.continuous = true
-      wakeWordRecognitionRef.current.interimResults = false
-
-      // Initialize command recognition
-      commandRecognitionRef.current = new SpeechRecognition()
-      commandRecognitionRef.current.continuous = false
-      commandRecognitionRef.current.interimResults = false
-
-      // Start listening for wake word
-      startWakeWordDetection()
+      startWakeWordDetection();
     } else {
-      setError("Speech recognition is not supported in this browser")
+      setError("Speech recognition is not supported in this browser");
     }
 
-    // Cleanup function
     return () => {
-      stopWakeWordDetection()
-      stopCommandRecognition()
-    }
-  }, [])
+      stopWakeWordDetection();
+      stopAudioStreaming();
+      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+        websocketRef.current.close();
+      }
+    };
+  }, []);
 
-  // Function to start listening for the wake word
   const startWakeWordDetection = useCallback(() => {
-    if (!wakeWordRecognitionRef.current) return
+    if (!wakeWordRecognitionRef.current) return;
 
     try {
       wakeWordRecognitionRef.current.onresult = (event) => {
-        const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase().trim()
-        console.log("Wake word detection heard:", transcript)
+        const transcript = event.results[event.results.length - 1][0].transcript
+          .toLowerCase()
+          .trim();
+        console.log("Wake word detection heard:", transcript);
 
-        // Check for wake word "hey grab"
         if (transcript.includes("hey grab")) {
-          console.log("Wake word detected!")
-
-          // Stop wake word detection and start command recognition
-          stopWakeWordDetection()
-          startCommandRecognition()
-
-          // Provide audio feedback
-          speakFeedback("Voice commands activated. How can I help?")
+          console.log("Wake word detected!");
+          stopWakeWordDetection();
+          speakFeedback("Voice commands activated.");
+          startAudioStreaming(); // 🟩 Stream audio after wake word
         }
-      }
+      };
 
       wakeWordRecognitionRef.current.onend = () => {
-        // Restart wake word detection if it ends and we're still in wake word mode
         if (isListeningForWakeWord) {
-          console.log("Wake word detection ended, restarting...")
-          wakeWordRecognitionRef.current?.start()
+          console.log("Wake word detection ended, restarting...");
+          wakeWordRecognitionRef.current?.start();
         }
-      }
+      };
 
       wakeWordRecognitionRef.current.onerror = (event) => {
-        console.error("Wake word detection error:", event.error)
-        // Don't set error state for "no-speech" errors as they're common
+        console.error("Wake word detection error:", event.error);
         if (event.error !== "no-speech") {
-          setError(`Wake word detection error: ${event.error}`)
+          setError(`Wake word detection error: ${event.error}`);
         }
-
-        // Restart wake word detection on error
         if (isListeningForWakeWord) {
           setTimeout(() => {
-            wakeWordRecognitionRef.current?.start()
-          }, 100)
+            wakeWordRecognitionRef.current?.start();
+          }, 100);
         }
-      }
+      };
 
-      wakeWordRecognitionRef.current.start()
-      setIsListeningForWakeWord(true)
-      setError(null)
+      wakeWordRecognitionRef.current.start();
+      setIsListeningForWakeWord(true);
+      setError(null);
     } catch (err) {
-      console.error("Error starting wake word detection:", err)
-      setError("Failed to start wake word detection")
+      console.error("Error starting wake word detection:", err);
+      setError("Failed to start wake word detection");
     }
-  }, [isListeningForWakeWord])
+  }, [isListeningForWakeWord]);
 
-  // Function to stop wake word detection
   const stopWakeWordDetection = useCallback(() => {
-    if (!wakeWordRecognitionRef.current) return
-
+    if (!wakeWordRecognitionRef.current) return;
     try {
-      wakeWordRecognitionRef.current.stop()
-      setIsListeningForWakeWord(false)
+      wakeWordRecognitionRef.current.stop();
+      setIsListeningForWakeWord(false);
     } catch (err) {
-      console.error("Error stopping wake word detection:", err)
+      console.error("Error stopping wake word detection:", err);
     }
-  }, [])
+  }, []);
 
-  // Function to start command recognition
-  const startCommandRecognition = useCallback(() => {
-    if (!commandRecognitionRef.current) return
-
-    try {
-      commandRecognitionRef.current.onresult = (event) => {
-        const transcript = event.results[0][0].transcript.toLowerCase().trim()
-        console.log("Command recognition heard:", transcript)
-        setLastCommand(transcript)
-
-        // Process the command
-        processCommand(transcript)
-      }
-
-      commandRecognitionRef.current.onend = () => {
-        // If voice commands are still active, restart command recognition
-        if (isVoiceCommandActive) {
-          console.log("Command recognition ended, restarting...")
-          setTimeout(() => {
-            commandRecognitionRef.current?.start()
-          }, 100)
-        }
-      }
-
-      commandRecognitionRef.current.onerror = (event) => {
-        console.error("Command recognition error:", event.error)
-        if (event.error !== "no-speech") {
-          setError(`Command recognition error: ${event.error}`)
-        }
-
-        // Restart command recognition on error if still active
-        if (isVoiceCommandActive) {
-          setTimeout(() => {
-            commandRecognitionRef.current?.start()
-          }, 100)
-        }
-      }
-
-      commandRecognitionRef.current.start()
-      setIsVoiceCommandActive(true)
-    } catch (err) {
-      console.error("Error starting command recognition:", err)
-      setError("Failed to start command recognition")
-    }
-  }, [isVoiceCommandActive])
-
-  // Function to stop command recognition
-  const stopCommandRecognition = useCallback(() => {
-    if (!commandRecognitionRef.current) return
-
-    try {
-      commandRecognitionRef.current.stop()
-      setIsVoiceCommandActive(false)
-    } catch (err) {
-      console.error("Error stopping command recognition:", err)
-    }
-  }, [])
-
-  // Function to process voice commands - SIMPLIFIED to just online/offline
-  const processCommand = useCallback(
-    (command: string) => {
-      console.log("Processing command:", command)
-
-      // Handle deactivation commands
-      if (
-        command.includes("bye grab") ||
-        command.includes("buy grab") ||
-        command.includes("goodbye grab") ||
-        command.includes("stop listening") ||
-        command.includes("turn off voice commands")
-      ) {
-        speakFeedback("Voice commands deactivated")
-        stopCommandRecognition()
-        startWakeWordDetection()
-        return
-      }
-
-      // Handle driver status commands - ONLY THESE COMMANDS ARE KEPT
-      if (command.includes("go online")) {
-        if (driverStatus === DriverStatus.OFFLINE) {
-          toggleDriverStatus()
-          speakFeedback("Going online")
-        } else {
-          speakFeedback("You are already online")
-        }
-      } else if (command.includes("go offline")) {
-        if (driverStatus === DriverStatus.ONLINE) {
-          toggleDriverStatus()
-          speakFeedback("Going offline")
-        } else {
-          speakFeedback("You are already offline")
-        }
-      }
-      // Handle help command
-      else if (command.includes("help") || command.includes("what can you do")) {
-        speakFeedback("Available commands include: go online and go offline")
-      }
-      // Unknown command
-      else {
-        speakFeedback(
-          "Sorry, I didn't understand that command. You can say go online, go offline, or bye grab to exit.",
-        )
-      }
-    },
-    [driverStatus, toggleDriverStatus, stopCommandRecognition, startWakeWordDetection],
-  )
-
-  // Function to provide audio feedback
   const speakFeedback = useCallback((text: string) => {
     if ("speechSynthesis" in window) {
-      const utterance = new SpeechSynthesisUtterance(text)
-      utterance.rate = 1.0
-      utterance.pitch = 1.0
-      utterance.volume = 1.0
-      window.speechSynthesis.speak(utterance)
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+      window.speechSynthesis.speak(utterance);
     }
-  }, [])
+  }, []);
 
-  // Function to manually activate voice commands (for testing)
-  const activateVoiceCommands = useCallback(() => {
-    if (isVoiceCommandActive) {
-      // If already active, deactivate
-      speakFeedback("Voice commands deactivated")
-      stopCommandRecognition()
-      startWakeWordDetection()
-    } else {
-      // If not active, activate
-      stopWakeWordDetection()
-      startCommandRecognition()
-      speakFeedback("Voice commands activated. How can I help?")
+  // 🟩 REPLACED startCommandRecognition with audio streaming
+  const startAudioStreaming = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = stream;
+
+      // 🟩 Setup WebSocket
+      websocketRef.current = new WebSocket("ws://localhost:8765");
+
+      websocketRef.current.onopen = () => {
+        console.log("WebSocket connection opened");
+        // 🟩 Start sending audio chunks
+        const mediaRecorder = new MediaRecorder(stream, {
+          mimeType: "audio/webm;codecs=opus",
+        });
+        mediaRecorderRef.current = mediaRecorder;
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0 && websocketRef.current?.readyState === WebSocket.OPEN) {
+            websocketRef.current.send(event.data); // 🟩 Send binary audio
+          }
+        };
+
+        mediaRecorder.start(250); // send chunks every 250ms
+        setIsVoiceCommandActive(true);
+      };
+
+      websocketRef.current.onerror = (error) => {
+        console.error("WebSocket error:", error);
+        setError("WebSocket error");
+      };
+
+      websocketRef.current.onclose = () => {
+        console.log("WebSocket connection closed");
+      };
+    } catch (err) {
+      console.error("Error starting audio streaming:", err);
+      setError("Failed to start audio streaming");
     }
-  }, [
-    isVoiceCommandActive,
-    stopWakeWordDetection,
-    startCommandRecognition,
-    stopCommandRecognition,
-    startWakeWordDetection,
-    speakFeedback,
-  ])
+  }, []);
+
+  const stopAudioStreaming = useCallback(() => {
+    if (mediaRecorderRef.current) {
+      console.log("stopAudioStreaming: mediaRecorderRef.current is NOT null"); // 🟢 DEBUG - Check if this line is printed
+      mediaRecorderRef.current.stop(); // 🟩 Stop media recorder
+      mediaRecorderRef.current.ondataavailable = async (event) => { // Capture the last data
+        console.log("ondataavailable event triggered"); // 🟢 DEBUG - Check if this line is printed
+        if (event.data && event.data.size > 0) {
+          console.log("event.data.size > 0, downloading Blob"); // 🟢 DEBUG - Check if this line is printed
+          downloadBlob(event.data, "recorded-audio.webm"); // Download the Blob
+        } else {
+          console.log("event.data is empty or size is 0"); // 🟢 DEBUG - Check if this line is printed
+        }
+  
+        localStreamRef.current?.getTracks().forEach((track) => track.stop());
+  
+        if (websocketRef.current?.readyState === WebSocket.OPEN) {
+          websocketRef.current.close();
+        }
+  
+        mediaRecorderRef.current = null;
+        localStreamRef.current = null;
+        websocketRef.current = null;
+        setIsVoiceCommandActive(false);
+      };
+    } else {
+      console.log("stopAudioStreaming: mediaRecorderRef.current is NULL"); // 🟢 DEBUG - Check if this line is printed
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      if (websocketRef.current?.readyState === WebSocket.OPEN) {
+        websocketRef.current.close();
+      }
+      mediaRecorderRef.current = null;
+      localStreamRef.current = null;
+      websocketRef.current = null;
+      setIsVoiceCommandActive(false);
+    }
+  }, []);
+  
+  // Helper function to download Blob
+  const downloadBlob = (blob: Blob, filename: string) => {
+    console.log("downloadBlob function called", { blob, filename }); // 🟢 DEBUG - Check if this line is printed
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    console.log("downloadBlob function finished"); // 🟢 DEBUG - Check if this line is printed
+  };
+
+  const toggleVoiceActivation = useCallback(() => {
+    if (isVoiceCommandActive) {
+      speakFeedback("Voice commands deactivated.");
+      stopAudioStreaming();
+      startWakeWordDetection();
+    } else {
+      stopWakeWordDetection();
+      startAudioStreaming();
+      speakFeedback("Voice commands activated.");
+    }
+  }, [isVoiceCommandActive, startWakeWordDetection, speakFeedback]);
 
   return {
     isSupported,
     isListeningForWakeWord,
     isVoiceCommandActive,
-    lastCommand,
     error,
-    activateVoiceCommands,
-  }
+    toggleVoiceActivation,
+  };
 }
