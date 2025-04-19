@@ -20,6 +20,7 @@ import asyncio
 import io
 import soundfile as sf  # Import soundfile for saving audio chunks
 from supabase import create_client, Client
+import uuid  # Import uuid for generating unique driver IDs
 
 app = FastAPI()
 
@@ -114,8 +115,35 @@ except Exception as e:
 # --- Supabase Client ---
 SUPABASE_URL = "https://vqukmlutaqthsmaprieb.supabase.co/"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxdWttbHV0YXF0aHNtYXByaWViIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NzIwMzAsImV4cCI6MjA2MDQ0ODAzMH0.hwwcVLCYDYLVHfajYD77EHT0H2_0GmTv3kAOTLtlpbo"
+BUCKET_NAME = "grab-buddy-audio-logs"  # Define Supabase Storage bucket name
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def insert_driver_log(driver_id: str, chat_log: dict) -> dict:
+    """
+    Inserts a chat log for a driver into the 'driver_logs' table.
+    Stores the entire chat history, including both user and assistant messages,
+    and now potentially audio URLs.
+
+    Args:
+        driver_id (str): Unique identifier of the driver.
+        chat_log (dict): The chat log as a dictionary.
+
+    Returns:
+        dict: Supabase response.
+    """
+    try:
+        data = {
+            "driver_id": driver_id,
+            "chat_log": chat_log  # Supabase handles JSON dict automatically
+        }
+        # ADDED LOGGING
+        logging.info(f"Data being inserted into Supabase: {data}")
+        response = supabase.table("driver_logs").insert(data).execute()
+        return response.data
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # --- Audio Playback Functions ---
@@ -166,23 +194,57 @@ def _play_audio_sync(audio_data, samplerate):
 
 # --- Audio Processing and Intent Recognition ---
 
+async def upload_audio_to_supabase(file_path: str, storage_path: str) -> Optional[str]:
+    """
+    Uploads a single audio file to Supabase Storage and returns the public URL.
 
-async def process_audio_chunk(websocket: WebSocket, audio_chunk: np.ndarray, chat_history):
-    """Processes audio chunk: noise reduction, STT, intent, and response."""
+    Args:
+        file_path (str): Local path to the audio file.
+        storage_path (str): Path in Supabase Storage (filename).
+
+    Returns:
+        Optional[str]: Public URL of the uploaded file, or None on error.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            response = supabase.storage.from_(BUCKET_NAME).upload(
+                path=storage_path,
+                file=f,
+                file_options={"content-type": "audio/wav"},
+            )
+        # ADDED LOGGING
+        logging.info(f"Supabase Storage upload response: {response}")
+        if hasattr(response, "path") and response.path:
+            file_url = supabase.storage.from_(
+                BUCKET_NAME).get_public_url(response.path)
+            logging.info(f"Uploaded to Supabase Storage: {storage_path} -> {file_url}")
+            return file_url
+        else:
+            logging.error(
+                f"Supabase Storage upload failed for {storage_path}: {response}")
+            return None
+    except Exception as e:
+        logging.error(
+            f"Error uploading {storage_path} to Supabase Storage: {e}")
+        return None
+
+
+async def process_audio_chunk(websocket: WebSocket, audio_chunk: np.ndarray, chat_history, driver_id: str):
+    """Processes audio chunk: noise reduction, STT, intent, and response, saves and uploads audio."""
     logging.info("Start processing audio chunk")
     samplerate = 16000
-
-    # --- DEBUGGING: SAVE AUDIO CHUNK TO WAV FILE ---
-    try:
-        # Unique filename using timestamp
-        debug_filename = f"audio_chunk_{time.time()}.wav"
-        sf.write(debug_filename, audio_chunk, samplerate)
-        logging.info(f"Saved audio chunk to: {debug_filename}")
-    except Exception as debug_e:
-        logging.error(f"Error saving debug audio file: {debug_e}")
-    # --- END DEBUGGING ---
+    audio_filename = f"{driver_id}_audio_chunk_{int(time.time())}.wav"
+    # Save in current directory for simplicity
+    audio_filepath = os.path.join(".", audio_filename)
 
     try:
+        # --- SAVE AUDIO CHUNK TO WAV FILE ---
+        try:
+            sf.write(audio_filepath, audio_chunk, samplerate)
+            logging.info(f"Saved audio chunk to: {audio_filepath}")
+        except Exception as save_e:
+            logging.error(f"Error saving audio file: {save_e}")
+
         # --- Noise Reduction ---
         reduced_noise = nr.reduce_noise(
             y=audio_chunk,
@@ -212,65 +274,92 @@ async def process_audio_chunk(websocket: WebSocket, audio_chunk: np.ndarray, cha
         return  # Or handle silence differently if needed
 
     user_text = query.lower()
-    # Add user query to session history
-    chat_history.append({"role": "user", "content": query})
+    # Add user query to session history, initially without audio_url
+    chat_history.append({"role": "user", "content": query, "audio_url": None})
     logging.debug(f"Added user query to chat history: {query}")
+
+    # --- Upload audio to Supabase Storage and get URL ---
+    audio_url = await upload_audio_to_supabase(audio_filepath, audio_filename)
+    # ADDED LOGGING
+    logging.info(f"Audio URL from upload_audio_to_supabase: {audio_url}")
+    if audio_url:
+        # Add audio_url to chat history
+        chat_history[-1]["audio_url"] = audio_url
+        logging.debug(f"Added audio_url to chat history: {audio_url}")
+        # ADDED LOGGING
+        logging.info(f"Chat history after adding audio_url: {chat_history}")
 
     # --- Intent Recognition (Gemini) ---
     intent_result = await asyncio.to_thread(speech_to_text_with_intent, user_text, chat_history)
 
-    if intent_result and intent_result["intent"] != "silence":
-        response_text = await asyncio.to_thread(handle_intent_and_get_response, intent_result, chat_history)
-        if response_text:
-            # Send TTS response over websocket
-            await send_tts_response(websocket, response_text)
+    if intent_result:  # Check if intent_result is not None before accessing it
+        # Store intent in chat history
+        # Add intent to the last user message
+        chat_history[-1]["intent"] = intent_result.get("intent", "unknown")
+        logging.debug(f"Added intent to chat history: {chat_history[-1]}")
+
+        if intent_result["intent"] != "silence":
+            response_text = await asyncio.to_thread(handle_intent_and_get_response, intent_result, chat_history)
+            if response_text:
+                # Send TTS response over websocket
+                # Pass chat_history here
+                # await send_tts_response(websocket, response_text, chat_history)
+                response_text, state_update = await asyncio.to_thread(handle_intent_and_get_response, intent_result, chat_history)
+                await send_tts_response(websocket, response_text, chat_history, state_update)
+
+    # --- Clean up local audio file ---
+    try:
+        os.remove(audio_filepath)
+        logging.info(f"Deleted local audio file: {audio_filepath}")
+    except Exception as delete_e:
+        logging.warning(
+            f"Error deleting local audio file {audio_filepath}: {delete_e}")
 
     logging.info("End processing audio chunk")
     return intent_result  # return intent result for session management
 
 
-async def send_tts_response(websocket: WebSocket, text_response: str):
-    """Generates TTS audio and sends it over WebSocket in chunks."""
+# Added chat_history parameter
+async def send_tts_response(websocket: WebSocket, text_response: str, chat_history, state_update: Optional[dict] = None):
     logging.info(f"Start sending TTS response: '{text_response}'")
     try:
-        async with tts_lock:  # Acquire lock before TTS generation and sending
-            logging.debug("TTS lock acquired.")
-
-            # Generate TTS audio
+        async with tts_lock:
+            llm_text_response = await asyncio.to_thread(generate_tts_with_llm, text_response, chat_history)
             audio_stream = tts_pipeline(text_response, voice=KOKORO_VOICE)
+
             audio_chunks = []
             for _, _, audio in audio_stream:
                 if audio is not None:
-                    if isinstance(audio, torch.Tensor):
-                        audio_np = audio.numpy().astype(np.float32)
-                    else:
-                        audio_np = audio.astype(np.float32)
+                    audio_np = audio.numpy().astype(np.float32) if isinstance(
+                        audio, torch.Tensor) else audio.astype(np.float32)
                     audio_chunks.append(audio_np)
 
-            # Concatenate audio chunks into a single audio array
             full_audio = np.concatenate(audio_chunks) if audio_chunks else None
 
             if full_audio is not None:
-                # Convert the full audio array to bytes
                 with io.BytesIO() as wav_io:
                     sf.write(wav_io, full_audio,
                              KOKORO_SAMPLERATE, format='WAV')
                     wav_io.seek(0)
                     wav_bytes = wav_io.read()
-
-                    # Stream TTS audio over websocket as a single message
                     await websocket.send_bytes(wav_bytes)
-                    logging.info("TTS response sent completely.")
-            else:
-                logging.warning("No audio data generated by TTS.")
+
+            # Send state update as JSON
+            if state_update:
+                await websocket.send_text(json.dumps({
+                    "type": "state_update",
+                    "payload": {
+                        "driverStatus": "ONLINE"
+                    }
+                }))
 
     except Exception as e:
         logging.error(f"Error during TTS generation or sending: {e}")
     finally:
         if tts_lock.locked():
-            tts_lock.release()  # Release lock after TTS is done, even if errors occur
-            logging.debug("TTS lock released.")
+            tts_lock.release()
         logging.info("End sending TTS response.")
+
 
 
 def get_ride_summary_text(limit: int = 3) -> str:
@@ -285,7 +374,7 @@ def get_ride_summary_text(limit: int = 3) -> str:
     """
     try:
         response = supabase.table("rides") \
-            .select("pickup_address, dropoff_address, estimated_fare") \
+            .select("pickup_address, dropoff_address, estimated_fare, id") \
             .limit(limit) \
             .execute()
 
@@ -335,28 +424,40 @@ def speech_to_text_with_intent(user_text: str, chat_history) -> Optional[Dict[st
             - **To select a specific ride:** "choose number one", "number 2 please", "I want ride 3", destination names.
             - **Parameters:**  `"ride_index"` (integer, 1-indexed) OR `"destination"` (string, ride destination)
 
-    2.  **Confirmation Intent:** User confirms an action.
+    2.  **Choose Booking Intent:** User wants to select a booking.
+        - **Intent Name:** `"choose_booking"`
+        - **Parameters:** `"ride_index"` (integer, 1-indexed)
+
+    3.  **Confirmation Intent:** User confirms an action.
         - **Intent Name:** `"confirm"`
 
-    3.  **Decline Intent:** User declines an action.
+    4.  **Decline Intent:** User declines an action.
         - **Intent Name:** `"decline"`
 
-    4.  **Directions Intent (General):** User requests directions, optionally with a destination.
+    5.  **Directions Intent (General):** User requests directions, optionally with a destination.
         - **Intent Name:** `"directions"`
         - **Parameters:** `"destination"` (string, optional).
 
-    5.  **Show Directions Intent (Ride-Related):** User wants directions for a booked ride.
+    6.  **Show Directions Intent (Ride-Related):** User wants directions for a booked ride.
         - **Intent Name:** `"show_directions"`
 
-    6.  **Traffic Info Intent:** User requests traffic information.
+    7.  **Traffic Info Intent:** User requests traffic information.
         - **Intent Name:** `"traffic_info"`
 
-    7.  **Weather Info Intent:** User requests weather information.
+    8.  **Weather Info Intent:** User requests weather information.
         - **Intent Name:** `"weather_info"`
 
-    8.  **Emergency Intent:** User indicates an emergency situation.
+    9.  **Emergency Intent:** User indicates an emergency situation.
         - **Intent Name:** `"emergency"`
         - **Examples:** "emergency", "I need help", "accident", "urgent assistance"
+
+    10. **Driver Status Intent:** User wants to go online or offline.
+        - **Intent Name:** `"driver_status"`
+        - **Parameters:** `"status"` (string: `"online"` or `"offline"`)
+
+    11. **Ride Action Intent:** User wants to accept, decline, start, or end a ride.
+        - **Intent Name:** `"ride_action"`
+        - **Parameters:** `"action"` (string: `"accept"`, `"decline"`, `"start"`, `"end"`)
 
     **Combined Intent Handling:**
     If the user expresses multiple intents (e.g., "weather and traffic", "directions and bookings"), return a combined intent:
@@ -410,6 +511,8 @@ def speech_to_text_with_intent(user_text: str, chat_history) -> Optional[Dict[st
 def generate_tts_with_llm(text_prompt: str, chat_history) -> str:
     """Generates TTS prompt using LLM based on text prompt and chat history."""
     logging.debug(f"Generating TTS prompt for: {text_prompt}")
+    # Log history before
+    logging.debug(f"Chat History before LLM generation: {chat_history}")
     prompt_with_history = f"""
         You are a helpful and concise assistant for a Grab driver.
         Generate a short, natural-sounding spoken response for the driver based on the following:
@@ -427,9 +530,11 @@ def generate_tts_with_llm(text_prompt: str, chat_history) -> str:
         llm_generated_text = response.text.strip()
         if llm_generated_text:
             logging.info(f"LLM generated TTS prompt: {llm_generated_text}")
+            # Add assistant response to history - SYSTEM CHAT IS STORED HERE
             chat_history.append(
-                # Add assistant response to history
                 {"role": "assistant", "content": llm_generated_text})
+            # Log history after
+            logging.debug(f"Chat History after LLM generation: {chat_history}")
             logging.debug(
                 f"Added assistant response to chat history: {llm_generated_text}")
             return llm_generated_text
@@ -494,10 +599,39 @@ def get_ride_details_from_text(ride_text: str) -> str:
     return "Ride details not available."
 
 
+async def book_ride(ride_index: int) -> str:
+    """Simulates booking a ride.  Replace with actual Supabase logic."""
+    try:
+        response = supabase.table("rides") \
+            .select("pickup_address, dropoff_address, estimated_fare, id") \
+            .limit(ride_index) \
+            .execute()
+        rides = response.data
+        chosen_ride = rides[ride_index - 1]
+        pickup = chosen_ride['pickup_address']
+        dropoff = chosen_ride['dropoff_address']
+        fare = chosen_ride['estimated_fare']
+
+        # Simulate updating the booking status in the database
+        # In a real application, you'd update a "status" field to "booked" or similar
+
+        # Generate a confirmation message
+        confirmation_message = (
+            f"Booking confirmed!  Ride from {pickup} to {dropoff}, "
+            f"estimated fare RM {fare:.2f}.  The passenger has been notified."
+        )
+        return confirmation_message
+
+    except Exception as e:
+        logging.error(f"Error booking ride: {e}")
+        return "Sorry, there was an error booking the ride."
+
+
 def handle_intent_and_get_response(intent_result, chat_history):
     """Handles intent and returns a text response (used in WebSocket context)."""
     logging.debug(f"Handling intent: {intent_result}")
     response_parts = []
+    state_update = {}
 
     if intent_result["intent"] == "combined_info":
         if "parameters" in intent_result and "intents" in intent_result["parameters"]:
@@ -506,6 +640,9 @@ def handle_intent_and_get_response(intent_result, chat_history):
                 response_parts.append(get_weather_info())
             if "traffic_info" in intents:
                 response_parts.append(get_traffic_info())
+            if "emergency" in intents:
+                response_parts.append(
+                    "Grab is notified of this issue and it is being looked at.")
             if "directions" in intents:
                 destination_for_directions = intent_result["parameters"].get(
                     "directions_parameters", {}).get("destination")
@@ -537,6 +674,19 @@ def handle_intent_and_get_response(intent_result, chat_history):
         response_parts.append("Here are your bookings:")
         response_parts.append(ride_summaries)  # Use fetched data
         # response_parts.extend(sample_rides)
+
+    elif intent_result["intent"] == "choose_booking":
+        ride_index = intent_result.get("parameters", {}).get("ride_index")
+        if ride_index is not None:
+            ride_index = int(ride_index)
+            # Attempt to book the ride
+            # Book ride asynchronously
+            booking_result = asyncio.run(book_ride(ride_index))
+            response_parts.append(booking_result)  # Add booking confirmation
+        else:
+            response_parts.append(
+                "Sorry, I couldn't determine which ride to book.")
+
     elif intent_result["intent"] == "unknown":
         response_parts.append(
             "")  # Or a default "I didn't understand" message
@@ -547,8 +697,31 @@ def handle_intent_and_get_response(intent_result, chat_history):
     elif intent_result["intent"] == "emergency":  # Added emergency intent
         response_parts.append(
             "Grab is notified of this issue and it is being looked at.")
+    elif intent_result["intent"] == "driver_status":
+        status = intent_result.get("parameters", {}).get("status")
+        if status == "online":
+            response_parts.append("You are now online.")
+            state_update = {"driverStatus": "ONLINE"}
+        elif status == "offline":
+            response_parts.append("You are now offline.")
+            state_update = {"driverStatus": "OFFLINE"}
 
-    return "\n".join(response_parts)
+    elif intent_result["intent"] == "ride_action":
+        action = intent_result.get("parameters", {}).get("action")
+        if action == "accept":
+            response_parts.append("Ride accepted.")
+            state_update = {"rideStatus": "ACCEPTED"}
+        elif action == "decline":
+            response_parts.append("Ride declined.")
+            state_update = {"rideStatus": "DECLINED"}
+        elif action == "start":
+            response_parts.append("Ride started.")
+            state_update = {"rideStatus": "STARTED"}
+        elif action == "end":
+            response_parts.append("Ride ended.")
+            state_update = {"rideStatus": "ENDED"}
+
+    return "\n".join(response_parts), state_update
 
 # --- WebSocket Endpoint ---
 
@@ -557,26 +730,33 @@ def handle_intent_and_get_response(intent_result, chat_history):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logging.info("WebSocket connection accepted.")
-    chat_history_session = []  # Session-specific chat history
+    # Session-specific chat history, stores both user and assistant messages
+    chat_history_session = []
     consecutive_unknown_intents_session = 0
+    # Generate unique driver ID for each session
+    driver_id = "c00a8d24-e297-4f12-9b8e-5d78cf28b5d0"
+    logging.info(f"Driver ID for this session: {driver_id}")
 
     try:
+        # Fixed initial greeting text - as requested by user
         initial_greeting_text = "Hello this is Grab Buddy! How can I help you?"
         # Send greeting via TTS
-        await send_tts_response(websocket, initial_greeting_text)
+        # Pass history here
+        await send_tts_response(websocket, initial_greeting_text, chat_history_session)
 
         while True:
             data = await websocket.receive_bytes()  # Receive audio data from WebSocket
             # Convert bytes to numpy float32 array
             audio_np = np.frombuffer(data, dtype=np.float32)
 
-            # Process audio chunk
-            intent_result = await process_audio_chunk(websocket, audio_np, chat_history_session)
+            # Process audio chunk, now passing driver_id
+            intent_result = await process_audio_chunk(websocket, audio_np, chat_history_session, driver_id)
 
             if intent_result and intent_result["intent"] == "unknown":
                 # Fallback for unknown intent in WebSocket context
                 # Send simple fallback TTS
-                await send_tts_response(websocket, "")
+                # Pass history here
+                await send_tts_response(websocket, "", chat_history_session)
 
     except WebSocketDisconnect:
         logging.info("WebSocket disconnected.")
@@ -584,6 +764,14 @@ async def websocket_endpoint(websocket: WebSocket):
         logging.error(f"WebSocket error: {e}")
     finally:
         logging.info("WebSocket connection closed.")
+        # Log chat history content for verification
+        logging.debug(
+            f"Chat history being logged to Supabase: {chat_history_session}")
+        # Log chat history to Supabase after connection is closed
+        log_result = insert_driver_log(
+            driver_id, {"messages": chat_history_session})
+        logging.info(f"Supabase log result on connection close: {log_result}")
+
 
 if __name__ == '__main__':
     import uvicorn

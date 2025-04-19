@@ -1,366 +1,370 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { DriverStatus, type RideStatus } from "./types";
-
-interface UseVoiceCommandsProps {
-  driverStatus: DriverStatus;
-  rideStatus: RideStatus;
-  toggleDriverStatus: () => void;
-  acceptRide: () => void;
-  declineRide: () => void;
-  startRide: () => void;
-  endRide: () => void;
-  toggleQueuedRidesPanel: () => void;
-  onVoiceCommand: (transcript: string) => void;
-}
+import { DriverStatus, RideStatus } from "./types";
 
 declare var SpeechRecognition: any;
 declare var webkitSpeechRecognition: any;
 
+interface UseVoiceCommandsProps {
+	driverStatus: DriverStatus;
+	rideStatus: RideStatus;
+	setDriverStatus: (status: DriverStatus) => void;
+	setRideStatus: (status: RideStatus) => void;
+	toggleDriverStatus: () => void;
+	acceptRide: () => void;
+	declineRide: () => void;
+	startRide: () => void;
+	endRide: () => void;
+	toggleQueuedRidesPanel: () => void;
+}
+
 export function useVoiceCommands({
-  driverStatus,
-  rideStatus,
-  toggleDriverStatus,
-  acceptRide,
-  declineRide,
-  startRide,
-  endRide,
-  toggleQueuedRidesPanel,
-  onVoiceCommand,
+	driverStatus,
+	rideStatus,
+	toggleDriverStatus,
+	acceptRide,
+	declineRide,
+	startRide,
+	endRide,
+	toggleQueuedRidesPanel,
 }: UseVoiceCommandsProps) {
-  const [isSupported, setIsSupported] = useState(false);
-  const [isListeningForWakeWord, setIsListeningForWakeWord] = useState(false);
-  const [isVoiceCommandActive, setIsVoiceCommandActive] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+	const [isSupported, setIsSupported] = useState(false);
+	const [isListeningForWakeWord, setIsListeningForWakeWord] = useState(false);
+	const [isVoiceCommandActive, setIsVoiceCommandActive] = useState(false);
+	const [lastCommand, setLastCommand] = useState("");
+	const [error, setError] = useState<string | null>(null);
 
-  const wakeWordRecognitionRef = useRef<SpeechRecognition | null>(null);
-  const websocketRef = useRef<WebSocket | null>(null);
-  const localStreamRef = useRef<MediaStream | null>(null);
+	const wakeWordRecognitionRef = useRef<SpeechRecognition | null>(null);
+	const commandRecognitionRef = useRef<SpeechRecognition | null>(null);
+	const isCommandRecognitionRunningRef = useRef<boolean>(false);
+	const isStartingCommandRecognitionRef = useRef<boolean>(false);
 
-  // Audio streaming refs
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const audioBufferRef = useRef<Float32Array[]>([]);
-  const accumulatedSamplesRef = useRef<number>(0);
-  const sampleRateRef = useRef<number>(16000); // Default, will be updated with actual context
-  const chunkDuration = 10; // seconds
-  const bufferSize = 4096; // ScriptProcessor buffer size
+	const socketRef = useRef<WebSocket | null>(null);
+	const audioContextRef = useRef<AudioContext | null>(null);
+	const processorRef = useRef<ScriptProcessorNode | null>(null);
+	const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+	const audioBufferRef = useRef<Float32Array[]>([]);
+	const accumulatedSamplesRef = useRef<number>(0);
+	const sampleRateRef = useRef<number>(16000);
+	const playbackCountRef = useRef(0);
+	const isPlayingRef = useRef(false);
+	const isTTSSpeakingRef = useRef(false);
+	const chunkDuration = 6;
+	const bufferSize = 4096;
 
+	useEffect(() => {
+		if (typeof window !== "undefined" && ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)) {
+			setIsSupported(true);
+			const SpeechRecognition = window.SpeechRecognition || webkitSpeechRecognition;
+			wakeWordRecognitionRef.current = new SpeechRecognition();
+			wakeWordRecognitionRef.current.continuous = true;
+			wakeWordRecognitionRef.current.interimResults = false;
 
-  useEffect(() => {
-    if (
-      typeof window !== "undefined" &&
-      ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)
-    ) {
-      setIsSupported(true);
-      const SpeechRecognition =
-        window.SpeechRecognition || webkitSpeechRecognition;
+			commandRecognitionRef.current = new SpeechRecognition();
+			commandRecognitionRef.current.continuous = false;
+			commandRecognitionRef.current.interimResults = false;
 
-      wakeWordRecognitionRef.current = new SpeechRecognition();
-      wakeWordRecognitionRef.current.continuous = true;
-      wakeWordRecognitionRef.current.interimResults = false;
+			startWakeWordDetection();
+		} else {
+			setError("Speech recognition is not supported in this browser");
+		}
 
-      startWakeWordDetection();
-    } else {
-      setError("Speech recognition is not supported in this browser");
-    }
+		return () => {
+			stopWakeWordDetection();
+			stopCommandRecognition();
+			stopStreaming();
+		};
+	}, []);
 
-    return () => {
-      stopWakeWordDetection();
-      stopAudioStreaming();
-      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-        websocketRef.current.close();
-      }
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-    };
-  }, []);
+	useEffect(() => {
+		if (isVoiceCommandActive) {
+			startStreaming();
+		} else {
+			stopStreaming();
+		}
+	}, [isVoiceCommandActive]);
 
-  const startWakeWordDetection = useCallback(() => {
-    if (!wakeWordRecognitionRef.current) return;
+	const startWakeWordDetection = useCallback(() => {
+		if (!wakeWordRecognitionRef.current) {
+			const SpeechRecognition = window.SpeechRecognition || webkitSpeechRecognition;
+			wakeWordRecognitionRef.current = new SpeechRecognition();
+			wakeWordRecognitionRef.current.continuous = true;
+			wakeWordRecognitionRef.current.interimResults = false;
+		}
 
-    try {
-      wakeWordRecognitionRef.current.onresult = (event) => {
-        const transcript = event.results[event.results.length - 1][0].transcript
-          .toLowerCase()
-          .trim();
-        console.log("Wake word detection heard:", transcript);
+		wakeWordRecognitionRef.current.onresult = (event) => {
+			const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase().trim();
+			if (transcript.includes("hey grab")) {
+				stopWakeWordDetection();
+				startCommandRecognition();
+			}
+		};
 
-        if (transcript.includes("hey grab")) {
-          console.log("Wake word detected!");
-          stopWakeWordDetection();
-          speakFeedback("Voice commands activated.");
-          startAudioStreaming(); // Start audio streaming after wake word
-        }
-      };
+		wakeWordRecognitionRef.current.onend = () => {
+			if (isListeningForWakeWord) {
+				wakeWordRecognitionRef.current?.start();
+			}
+		};
 
-      wakeWordRecognitionRef.current.onend = () => {
-        if (isListeningForWakeWord) {
-          console.log("Wake word detection ended, restarting...");
-          wakeWordRecognitionRef.current?.start();
-        }
-      };
+		wakeWordRecognitionRef.current.onerror = (event) => {
+			if (event.error !== "no-speech") {
+				setError(`Wake word error: ${event.error}`);
+			}
+			if (isListeningForWakeWord) {
+				setTimeout(() => wakeWordRecognitionRef.current?.start(), 100);
+			}
+		};
 
-      wakeWordRecognitionRef.current.onerror = (event) => {
-        console.error("Wake word detection error:", event.error);
-        if (event.error !== "no-speech") {
-          setError(`Wake word detection error: ${event.error}`);
-        }
-        if (isListeningForWakeWord) {
-          setTimeout(() => {
-            wakeWordRecognitionRef.current?.start();
-          }, 100);
-        }
-      };
+		wakeWordRecognitionRef.current.start();
+		setIsListeningForWakeWord(true);
+	}, [isListeningForWakeWord]);
 
-      wakeWordRecognitionRef.current.start();
-      setIsListeningForWakeWord(true);
-      setError(null);
-    } catch (err) {
-      console.error("Error starting wake word detection:", err);
-      setError("Failed to start wake word detection");
-    }
-  }, [isListeningForWakeWord]);
+	const stopWakeWordDetection = useCallback(() => {
+		if (wakeWordRecognitionRef.current) {
+			wakeWordRecognitionRef.current.stop();
+			wakeWordRecognitionRef.current = null;
+		}
+		setIsListeningForWakeWord(false);
+	}, []);
 
-  const stopWakeWordDetection = useCallback(() => {
-    if (!wakeWordRecognitionRef.current) return;
-    try {
-      wakeWordRecognitionRef.current.stop();
-      setIsListeningForWakeWord(false);
-    } catch (err) {
-      console.error("Error stopping wake word detection:", err);
-    }
-  }, []);
+	const startCommandRecognition = useCallback(() => {
+		if (!commandRecognitionRef.current) return;
+		if (isCommandRecognitionRunningRef.current || isStartingCommandRecognitionRef.current) return;
 
-  const speakFeedback = useCallback((text: string) => {
-    if ("speechSynthesis" in window) {
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.0;
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-      window.speechSynthesis.speak(utterance);
-    }
-  }, []);
+		isStartingCommandRecognitionRef.current = true;
 
-  const startAudioStreaming = useCallback(async () => {
-    try {
-      console.log("Starting streaming...");
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      console.log("getUserMedia success", stream);
-      localStreamRef.current = stream;
+		commandRecognitionRef.current.onstart = () => {
+			isCommandRecognitionRunningRef.current = true;
+			isStartingCommandRecognitionRef.current = false;
+		};
 
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      console.log("AudioContext sampleRate:", audioContext.sampleRate);
-      sampleRateRef.current = audioContext.sampleRate;
-      const source = audioContext.createMediaStreamSource(stream);
-      const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+		commandRecognitionRef.current.onresult = (event) => {
+			const transcript = event.results[0][0].transcript.toLowerCase().trim();
+			setLastCommand(transcript);
+			// No local command processing — backend handles it
+		};
 
-      const socket = new WebSocket("ws://127.0.0.1:8000/ws/grab_buddy"); // Replace with your server URL
-      socket.binaryType = "arraybuffer";
+		commandRecognitionRef.current.onend = () => {
+			isCommandRecognitionRunningRef.current = false;
+			isStartingCommandRecognitionRef.current = false;
+			if (isVoiceCommandActive) {
+				setTimeout(() => {
+					if (!isCommandRecognitionRunningRef.current && !isStartingCommandRecognitionRef.current) {
+						commandRecognitionRef.current?.start();
+					}
+				}, 200);
+			}
+		};
 
-      // Initialize state
-      setIsVoiceCommandActive(true);
-      audioBufferRef.current = [];
-      accumulatedSamplesRef.current = 0;
-      websocketRef.current = socket;
-      audioContextRef.current = audioContext;
-      processorRef.current = processor;
-      sourceRef.current = source;
+		commandRecognitionRef.current.onerror = (event) => {
+			isCommandRecognitionRunningRef.current = false;
+			isStartingCommandRecognitionRef.current = false;
+			if (event.error !== "no-speech") setError(`Command error: ${event.error}`);
+			if (isVoiceCommandActive) {
+				setTimeout(() => {
+					if (!isCommandRecognitionRunningRef.current && !isStartingCommandRecognitionRef.current) {
+						commandRecognitionRef.current?.start();
+					}
+				}, 100000000000);
+			}
+		};
 
+		commandRecognitionRef.current.start();
+		setIsVoiceCommandActive(true);
+	}, [isVoiceCommandActive]);
 
-      processor.onaudioprocess = (e) => {
-        const inputBuffer = e.inputBuffer.getChannelData(0);
-        const buffer44100Hz = new Float32Array(inputBuffer);
+	const stopCommandRecognition = useCallback(() => {
+		if (!commandRecognitionRef.current) return;
+		commandRecognitionRef.current.stop();
+		setIsVoiceCommandActive(false);
+		isCommandRecognitionRunningRef.current = false;
+		isStartingCommandRecognitionRef.current = false;
+	}, []);
 
-        // *** WEB AUDIO API RESAMPLING START ***
-        const originalSampleRate = audioContext.sampleRate;
-        const targetSampleRate = 16000;
-        let buffer16000Hz;
+	const startStreaming = async () => {
+		try {
+			const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+			const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+			sampleRateRef.current = audioContext.sampleRate;
+			const source = audioContext.createMediaStreamSource(stream);
+			const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+			const socket = new WebSocket("ws://127.0.0.1:8000/ws/grab_buddy");
+			socket.binaryType = "arraybuffer";
 
-        if (originalSampleRate !== targetSampleRate) {
-          console.log(`Resampling from ${originalSampleRate}Hz to ${targetSampleRate}Hz...`);
-          const offlineCtx = new OfflineAudioContext(
-            1,
-            inputBuffer.length * (targetSampleRate / originalSampleRate),
-            targetSampleRate
-          );
-          const bufferSource = offlineCtx.createBufferSource();
-          const audioBuffer = offlineCtx.createBuffer(1, inputBuffer.length, originalSampleRate);
-          audioBuffer.copyToChannel(inputBuffer, 0);
-          bufferSource.buffer = audioBuffer;
-          bufferSource.connect(offlineCtx.destination);
-          bufferSource.start();
+			processor.onaudioprocess = (e) => {
+				if (isTTSSpeakingRef.current) return;
+				const inputBuffer = e.inputBuffer.getChannelData(0);
+				const buffer44100Hz = new Float32Array(inputBuffer);
+				const originalSampleRate = audioContext.sampleRate;
+				const targetSampleRate = 16000;
 
-          offlineCtx
-            .startRendering()
-            .then((renderedBuffer) => {
-              buffer16000Hz = renderedBuffer.getChannelData(0);
+				if (originalSampleRate !== targetSampleRate) {
+					const offlineCtx = new OfflineAudioContext(
+						1,
+						inputBuffer.length * (targetSampleRate / originalSampleRate),
+						targetSampleRate
+					);
+					const bufferSource = offlineCtx.createBufferSource();
+					const audioBuffer = offlineCtx.createBuffer(1, inputBuffer.length, originalSampleRate);
+					audioBuffer.copyToChannel(inputBuffer, 0);
+					bufferSource.buffer = audioBuffer;
+					bufferSource.connect(offlineCtx.destination);
+					bufferSource.start();
 
-              // *** MOVED ORIGINAL CHUNKING AND SENDING LOGIC HERE, USING buffer16000Hz ***
-              audioBufferRef.current.push(buffer16000Hz);
-              accumulatedSamplesRef.current += buffer16000Hz.length;
+					offlineCtx.startRendering().then((renderedBuffer) => {
+						const buffer16000Hz = renderedBuffer.getChannelData(0);
+						handleChunkingAndSend(buffer16000Hz, socket, targetSampleRate);
+					});
+				} else {
+					handleChunkingAndSend(buffer44100Hz, socket, sampleRateRef.current);
+				}
+			};
 
-              // Calculate how many samples we need for chunkDuration seconds
-              const samplesNeeded = targetSampleRate * chunkDuration;
+			socket.onopen = () => {
+				source.connect(processor);
+				processor.connect(audioContext.destination);
+				socketRef.current = socket;
+				audioContextRef.current = audioContext;
+				processorRef.current = processor;
+				sourceRef.current = source;
+			};
 
-              if (accumulatedSamplesRef.current >= samplesNeeded) {
-                // Create a single buffer with exactly chunkDuration seconds of audio
-                const combinedBuffer = new Float32Array(samplesNeeded);
-                let offset = 0;
-                let remainingSamples = samplesNeeded;
+			socket.onmessage = (event) => {
+				console.log("WebSocket message received:", event.data);
+				if (typeof event.data === "string") {
+					try {
+						const message = JSON.parse(event.data);
+						if (message.type === "state_update") {
+							const { driverStatus: newDriverStatus, rideStatus: newRideStatus } = message.payload;
 
-                // Process buffers until we have exactly chunkDuration seconds
-                while (remainingSamples > 0 && audioBufferRef.current.length > 0) {
-                  const currentBuffer = audioBufferRef.current[0];
-                  const samplesToCopy = Math.min(currentBuffer.length, remainingSamples);
+							console.log(newDriverStatus);
 
-                  combinedBuffer.set(currentBuffer.subarray(0, samplesToCopy), offset);
-                  offset += samplesToCopy;
-                  remainingSamples -= samplesToCopy;
+							// Handle driver status change
+							if (newDriverStatus) {
+								if (newDriverStatus === "ONLINE") {
+									toggleDriverStatus();
+								} else if (newDriverStatus === "OFFLINE") {
+toggleDriverStatus();
+								}
+							}
 
-                  if (samplesToCopy === currentBuffer.length) {
-                    audioBufferRef.current.shift();
-                  } else {
-                    // If we didn't use the entire buffer, keep the remainder
-                    audioBufferRef.current[0] = currentBuffer.subarray(samplesToCopy);
-                  }
-                }
+							// Handle ride status change
+							if (newRideStatus) {
+								switch (newRideStatus) {
+									case "ACCEPTED":
+										acceptRide();
+										break;
+									case "DECLINED":
+										declineRide();
+										break;
+									case "STARTED":
+										startRide();
+										break;
+									case "ENDED":
+										endRide();
+										break;
+									default:
+										break;
+								}
+							}
+						}
+					} catch (e) {
+						console.warn("Non-JSON message received:", event.data);
+					}
+					return;
+				}
 
-                // Update the accumulated samples count
-                accumulatedSamplesRef.current = audioBufferRef.current.reduce((acc, buf) => acc + buf.length, 0);
+				// Handle audio playback
+				const arrayBuffer = event.data;
+				if (!audioContextRef.current) return;
+				audioContextRef.current.decodeAudioData(arrayBuffer.slice(0), (decodedData) => {
+					const source = audioContextRef.current!.createBufferSource();
+					isPlayingRef.current = true;
+					isTTSSpeakingRef.current = true;
+					source.buffer = decodedData;
+					source.connect(audioContextRef.current.destination);
+					source.start();
+					source.onended = () => {
+						isPlayingRef.current = false;
+						isTTSSpeakingRef.current = false;
+						playbackCountRef.current++;
+						if (playbackCountRef.current >= 2) stopStreaming();
+					};
+				});
+			};
 
-                // Send the chunk if WebSocket is open
-                if (socket.readyState === WebSocket.OPEN) {
-                  socket.send(combinedBuffer.buffer);
-                  console.log(`Sent audio chunk of ${combinedBuffer.length} samples (${chunkDuration} seconds)`);
-                }
-              }
-              // *** END MOVED CHUNKING AND SENDING LOGIC ***
-            })
-            .catch((err) => {
-              console.error("Rendering failed: " + err);
-              buffer16000Hz = buffer44100Hz; // Fallback to original buffer in case of resampling error
-              alert("Audio resampling failed! Audio might be slowed down. Please check console for errors.");
-            });
-          return; // Important: Exit here as processing continues in then()
-        } else {
-          buffer16000Hz = buffer44100Hz; // No resampling needed - unlikely in browsers
+			socket.onclose = () => {
+				isPlayingRef.current = false;
+				isTTSSpeakingRef.current = false;
+				stopCommandRecognition();
+				startWakeWordDetection();
+				stopStreaming();
+			};
 
-          // *** ORIGINAL CHUNKING AND SENDING LOGIC - NOW USING buffer16000Hz (which is buffer44100Hz if no resampling) ***
-          audioBufferRef.current.push(buffer16000Hz);
-          accumulatedSamplesRef.current += buffer16000Hz.length;
+			socket.onerror = () => {
+				isPlayingRef.current = false;
+				isTTSSpeakingRef.current = false;
+				stopCommandRecognition();
+				startWakeWordDetection();
+				stopStreaming();
+			};
+		} catch (err) {
+			console.error("Streaming error:", err);
+		}
+	};
 
-          // Calculate how many samples we need for chunkDuration seconds
-          const samplesNeeded = sampleRateRef.current * chunkDuration;
+	const handleChunkingAndSend = (buffer: Float32Array, socket: WebSocket, sampleRate: number) => {
+		audioBufferRef.current.push(buffer);
+		accumulatedSamplesRef.current += buffer.length;
+		const samplesNeeded = sampleRate * chunkDuration;
 
-          if (accumulatedSamplesRef.current >= samplesNeeded) {
-            // Create a single buffer with exactly chunkDuration seconds of audio
-            const combinedBuffer = new Float32Array(samplesNeeded);
-            let offset = 0;
-            let remainingSamples = samplesNeeded;
+		if (accumulatedSamplesRef.current >= samplesNeeded) {
+			const combinedBuffer = new Float32Array(samplesNeeded);
+			let offset = 0;
+			let remaining = samplesNeeded;
 
-            // Process buffers until we have exactly chunkDuration seconds
-            while (remainingSamples > 0 && audioBufferRef.current.length > 0) {
-              const currentBuffer = audioBufferRef.current[0];
-              const samplesToCopy = Math.min(currentBuffer.length, remainingSamples);
+			while (remaining > 0 && audioBufferRef.current.length > 0) {
+				const current = audioBufferRef.current[0];
+				const toCopy = Math.min(current.length, remaining);
+				combinedBuffer.set(current.subarray(0, toCopy), offset);
+				offset += toCopy;
+				remaining -= toCopy;
 
-              combinedBuffer.set(currentBuffer.subarray(0, samplesToCopy), offset);
-              offset += samplesToCopy;
-              remainingSamples -= samplesToCopy;
+				if (toCopy === current.length) {
+					audioBufferRef.current.shift();
+				} else {
+					audioBufferRef.current[0] = current.subarray(toCopy);
+				}
+			}
 
-              if (samplesToCopy === currentBuffer.length) {
-                audioBufferRef.current.shift();
-              } else {
-                // If we didn't use the entire buffer, keep the remainder
-                audioBufferRef.current[0] = currentBuffer.subarray(samplesToCopy);
-              }
-            }
+			accumulatedSamplesRef.current = audioBufferRef.current.reduce((acc, buf) => acc + buf.length, 0);
+			if (socket.readyState === WebSocket.OPEN) {
+				socket.send(combinedBuffer.buffer);
+			}
+		}
+	};
 
-            // Update the accumulated samples count
-            accumulatedSamplesRef.current = audioBufferRef.current.reduce((acc, buf) => acc + buf.length, 0);
+	const stopStreaming = () => {
+		if (isPlayingRef.current || isTTSSpeakingRef.current) return;
+		processorRef.current?.disconnect();
+		sourceRef.current?.disconnect();
+		if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+			audioContextRef.current.close();
+		}
+		audioContextRef.current = null;
+		socketRef.current?.close();
+		socketRef.current = null;
+		audioBufferRef.current = [];
+		accumulatedSamplesRef.current = 0;
+		playbackCountRef.current = 0;
+	};
 
-            // Send the chunk if WebSocket is open
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(combinedBuffer.buffer);
-              console.log(`Sent audio chunk of ${combinedBuffer.length} samples (${chunkDuration} seconds)`);
-            }
-          }
-          // *** END ORIGINAL CHUNKING AND SENDING LOGIC  ***
-        }
-        // *** WEB AUDIO API RESAMPLING END ***
-      };
-
-      socket.onopen = () => {
-        console.log("WebSocket connection opened for audio streaming");
-        source.connect(processor);
-        processor.connect(audioContext.destination);
-      };
-
-      socket.onerror = (error) => {
-        console.error("WebSocket error:", error);
-        setError("WebSocket error during audio streaming");
-        setIsVoiceCommandActive(false);
-      };
-
-      socket.onclose = () => {
-        console.log("WebSocket connection closed for audio streaming");
-        setIsVoiceCommandActive(false);
-      };
-
-
-    } catch (err) {
-      console.error("Error starting audio streaming:", err);
-      setError("Failed to start audio streaming");
-      setIsVoiceCommandActive(false);
-    }
-  }, []);
-
-  const stopAudioStreaming = useCallback(() => {
-    console.log("Stopping streaming...");
-    setIsVoiceCommandActive(false);
-
-    if (processorRef.current) {
-      processorRef.current.onaudioprocess = null;
-      processorRef.current.disconnect();
-    }
-    if (sourceRef.current) {
-      sourceRef.current.disconnect();
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    if (websocketRef.current) {
-      websocketRef.current.close();
-      websocketRef.current = null;
-    }
-
-    audioBufferRef.current = [];
-    accumulatedSamplesRef.current = 0;
-    console.log("Streaming stopped");
-  }, []);
-
-
-  const toggleVoiceActivation = useCallback(() => {
-    if (isVoiceCommandActive) {
-      speakFeedback("Voice commands deactivated.");
-      stopAudioStreaming();
-      startWakeWordDetection();
-    } else {
-      stopWakeWordDetection();
-      startAudioStreaming();
-      speakFeedback("Voice commands activated.");
-    }
-  }, [isVoiceCommandActive, startWakeWordDetection, speakFeedback, stopAudioStreaming, startAudioStreaming]);
-
-  return {
-    isSupported,
-    isListeningForWakeWord,
-    isVoiceCommandActive,
-    error,
-    toggleVoiceActivation,
-  };
+	return {
+		isSupported,
+		isListeningForWakeWord,
+		isVoiceCommandActive,
+		lastCommand,
+		error,
+	};
 }
