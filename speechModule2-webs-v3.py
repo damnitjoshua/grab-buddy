@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO,
 
 # --- API Keys and Model Settings ---
 # Replace with your actual API key or environment variable
-GOOGLE_API_KEY = "AIzaSyAf8HxoCsImAlgliS43dTaixkIbC6mgR7o"
+GOOGLE_API_KEY = ""
 GEMINI_MODEL_NAME = "gemini-2.0-flash-lite"
 GEMINI_TEMPERATURE = 0.3
 GEMINI_TOP_P = 0.9
@@ -114,7 +114,7 @@ except Exception as e:
 
 # --- Supabase Client ---
 SUPABASE_URL = "https://vqukmlutaqthsmaprieb.supabase.co/"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxdWttbHV0YXF0aHNtYXByaWViIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NzIwMzAsImV4cCI6MjA2MDQ0ODAzMH0.hwwcVLCYDYLVHfajYD77EHT0H2_0GmTv3kAOTLtlpbo"
+SUPABASE_KEY = ""
 BUCKET_NAME = "grab-buddy-audio-logs"  # Define Supabase Storage bucket name
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
