@@ -6,7 +6,6 @@ Check out our technical documentation [here](https://docs.google.com/document/d/
 Check out our slides [here](https://docs.google.com/presentation/d/1UNVEqKLw4onzt-WcmKoE9auZqQljWi289nAipNrMeS8/edit?usp=sharing).
 
 
----
 ## 🏗️ Solution Architecture
 
 Our system enables seamless voice interaction for drivers through the following pipeline:
@@ -31,7 +30,6 @@ Audio responses are generated using Kokoro TTS (86M model) for natural and respo
 All interactions are stored in a Supabase SQL database for monitoring, analytics, and performance insights.
 
 
----
 
 ## 🚀 Built with
 
@@ -43,7 +41,6 @@ All interactions are stored in a Supabase SQL database for monitoring, analytics
 - Hugging Face
 - Gemini
 
----
 
 ## 📦 Installation
 
@@ -55,7 +52,7 @@ git clone https://github.com/damnitjoshua/grab-buddy
 cd grab-buddy
 ```
 
----
+
 
 ## ⚙️ Setup
 
@@ -103,5 +100,5 @@ streamlit run app.py
 
 ***
 
-Happy Driving 
+🚗😊 Happy Driving!
 
