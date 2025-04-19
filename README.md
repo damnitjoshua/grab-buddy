@@ -85,7 +85,7 @@ venv/Scripts/activate
 pip install -r requirements.txt
 
 # Start the FastAPI server
-fastapi dev speechModule2-webs.py
+fastapi dev speechModule2-webs-v3.py
 ```
 
 ### 3. Start the Analytics dashboard
