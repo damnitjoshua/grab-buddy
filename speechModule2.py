@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Replace with your actual API key or environment variable
-GOOGLE_API_KEY = "AIzaSyAf8HxoCsImAlgliS43dTaixkIbC6mgR7o"
+GOOGLE_API_KEY = ""
 GEMINI_MODEL_NAME = "gemini-2.0-flash-lite"
 GEMINI_TEMPERATURE = 0.3
 GEMINI_TOP_P = 0.9
