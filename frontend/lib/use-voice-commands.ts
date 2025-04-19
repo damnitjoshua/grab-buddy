@@ -1,309 +1,370 @@
-"use client"
+"use client";
 
-import { useState, useEffect, useCallback, useRef } from "react"
-import { DriverStatus, type RideStatus } from "./types"
+import { useState, useEffect, useCallback, useRef } from "react";
+import { DriverStatus, RideStatus } from "./types";
 
-// Define the available voice commands
-type VoiceCommand =
-  | "go online"
-  | "go offline"
-  | "accept ride"
-  | "decline ride"
-  | "arrived at pickup"
-  | "start ride"
-  | "end ride"
-  | "view requests"
-  | "cancel"
+declare var SpeechRecognition: any;
+declare var webkitSpeechRecognition: any;
 
-// Define the props for the hook
 interface UseVoiceCommandsProps {
-  driverStatus: DriverStatus
-  rideStatus: RideStatus
-  toggleDriverStatus: () => void
-  acceptRide: () => void
-  declineRide: () => void
-  startRide: () => void
-  endRide: () => void
-  toggleQueuedRidesPanel: () => void
+	driverStatus: DriverStatus;
+	rideStatus: RideStatus;
+	setDriverStatus: (status: DriverStatus) => void;
+	setRideStatus: (status: RideStatus) => void;
+	toggleDriverStatus: () => void;
+	acceptRide: () => void;
+	declineRide: () => void;
+	startRide: () => void;
+	endRide: () => void;
+	toggleQueuedRidesPanel: () => void;
 }
 
-// Declare SpeechRecognition
-declare var SpeechRecognition: any
-declare var webkitSpeechRecognition: any
-
 export function useVoiceCommands({
-  driverStatus,
-  rideStatus,
-  toggleDriverStatus,
-  acceptRide,
-  declineRide,
-  startRide,
-  endRide,
-  toggleQueuedRidesPanel,
+	driverStatus,
+	rideStatus,
+	toggleDriverStatus,
+	acceptRide,
+	declineRide,
+	startRide,
+	endRide,
+	toggleQueuedRidesPanel,
 }: UseVoiceCommandsProps) {
-  // State for tracking if voice recognition is supported
-  const [isSupported, setIsSupported] = useState(false)
+	const [isSupported, setIsSupported] = useState(false);
+	const [isListeningForWakeWord, setIsListeningForWakeWord] = useState(false);
+	const [isVoiceCommandActive, setIsVoiceCommandActive] = useState(false);
+	const [lastCommand, setLastCommand] = useState("");
+	const [error, setError] = useState<string | null>(null);
 
-  // State for tracking if we're listening for the wake word
-  const [isListeningForWakeWord, setIsListeningForWakeWord] = useState(false)
+	const wakeWordRecognitionRef = useRef<SpeechRecognition | null>(null);
+	const commandRecognitionRef = useRef<SpeechRecognition | null>(null);
+	const isCommandRecognitionRunningRef = useRef<boolean>(false);
+	const isStartingCommandRecognitionRef = useRef<boolean>(false);
 
-  // State for tracking if voice commands are active (after wake word detected)
-  const [isVoiceCommandActive, setIsVoiceCommandActive] = useState(false)
+	const socketRef = useRef<WebSocket | null>(null);
+	const audioContextRef = useRef<AudioContext | null>(null);
+	const processorRef = useRef<ScriptProcessorNode | null>(null);
+	const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+	const audioBufferRef = useRef<Float32Array[]>([]);
+	const accumulatedSamplesRef = useRef<number>(0);
+	const sampleRateRef = useRef<number>(16000);
+	const playbackCountRef = useRef(0);
+	const isPlayingRef = useRef(false);
+	const isTTSSpeakingRef = useRef(false);
+	const chunkDuration = 6;
+	const bufferSize = 4096;
 
-  // State for tracking the last recognized command
-  const [lastCommand, setLastCommand] = useState<string>("")
+	useEffect(() => {
+		if (typeof window !== "undefined" && ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)) {
+			setIsSupported(true);
+			const SpeechRecognition = window.SpeechRecognition || webkitSpeechRecognition;
+			wakeWordRecognitionRef.current = new SpeechRecognition();
+			wakeWordRecognitionRef.current.continuous = true;
+			wakeWordRecognitionRef.current.interimResults = false;
 
-  // State for tracking error messages
-  const [error, setError] = useState<string | null>(null)
+			commandRecognitionRef.current = new SpeechRecognition();
+			commandRecognitionRef.current.continuous = false;
+			commandRecognitionRef.current.interimResults = false;
 
-  // Refs for the speech recognition instances
-  const wakeWordRecognitionRef = useRef<SpeechRecognition | null>(null)
-  const commandRecognitionRef = useRef<SpeechRecognition | null>(null)
+			startWakeWordDetection();
+		} else {
+			setError("Speech recognition is not supported in this browser");
+		}
 
-  // Initialize speech recognition
-  useEffect(() => {
-    // Check if the browser supports the Web Speech API
-    if (typeof window !== "undefined" && ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)) {
-      setIsSupported(true)
+		return () => {
+			stopWakeWordDetection();
+			stopCommandRecognition();
+			stopStreaming();
+		};
+	}, []);
 
-      // Create the SpeechRecognition instances
-      const SpeechRecognition = window.SpeechRecognition || webkitSpeechRecognition
+	useEffect(() => {
+		if (isVoiceCommandActive) {
+			startStreaming();
+		} else {
+			stopStreaming();
+		}
+	}, [isVoiceCommandActive]);
 
-      // Initialize wake word recognition
-      wakeWordRecognitionRef.current = new SpeechRecognition()
-      wakeWordRecognitionRef.current.continuous = true
-      wakeWordRecognitionRef.current.interimResults = false
+	const startWakeWordDetection = useCallback(() => {
+		if (!wakeWordRecognitionRef.current) {
+			const SpeechRecognition = window.SpeechRecognition || webkitSpeechRecognition;
+			wakeWordRecognitionRef.current = new SpeechRecognition();
+			wakeWordRecognitionRef.current.continuous = true;
+			wakeWordRecognitionRef.current.interimResults = false;
+		}
 
-      // Initialize command recognition
-      commandRecognitionRef.current = new SpeechRecognition()
-      commandRecognitionRef.current.continuous = false
-      commandRecognitionRef.current.interimResults = false
+		wakeWordRecognitionRef.current.onresult = (event) => {
+			const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase().trim();
+			if (transcript.includes("hey grab")) {
+				stopWakeWordDetection();
+				startCommandRecognition();
+			}
+		};
 
-      // Start listening for wake word
-      startWakeWordDetection()
-    } else {
-      setError("Speech recognition is not supported in this browser")
-    }
+		wakeWordRecognitionRef.current.onend = () => {
+			if (isListeningForWakeWord) {
+				wakeWordRecognitionRef.current?.start();
+			}
+		};
 
-    // Cleanup function
-    return () => {
-      stopWakeWordDetection()
-      stopCommandRecognition()
-    }
-  }, [])
+		wakeWordRecognitionRef.current.onerror = (event) => {
+			if (event.error !== "no-speech") {
+				setError(`Wake word error: ${event.error}`);
+			}
+			if (isListeningForWakeWord) {
+				setTimeout(() => wakeWordRecognitionRef.current?.start(), 100);
+			}
+		};
 
-  // Function to start listening for the wake word
-  const startWakeWordDetection = useCallback(() => {
-    if (!wakeWordRecognitionRef.current) return
+		wakeWordRecognitionRef.current.start();
+		setIsListeningForWakeWord(true);
+	}, [isListeningForWakeWord]);
 
-    try {
-      wakeWordRecognitionRef.current.onresult = (event) => {
-        const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase().trim()
-        console.log("Wake word detection heard:", transcript)
+	const stopWakeWordDetection = useCallback(() => {
+		if (wakeWordRecognitionRef.current) {
+			wakeWordRecognitionRef.current.stop();
+			wakeWordRecognitionRef.current = null;
+		}
+		setIsListeningForWakeWord(false);
+	}, []);
 
-        // Check for wake word "hey grab"
-        if (transcript.includes("hey grab")) {
-          console.log("Wake word detected!")
+	const startCommandRecognition = useCallback(() => {
+		if (!commandRecognitionRef.current) return;
+		if (isCommandRecognitionRunningRef.current || isStartingCommandRecognitionRef.current) return;
 
-          // Stop wake word detection and start command recognition
-          stopWakeWordDetection()
-          startCommandRecognition()
+		isStartingCommandRecognitionRef.current = true;
 
-          // Provide audio feedback
-          speakFeedback("Voice commands activated. How can I help?")
-        }
-      }
+		commandRecognitionRef.current.onstart = () => {
+			isCommandRecognitionRunningRef.current = true;
+			isStartingCommandRecognitionRef.current = false;
+		};
 
-      wakeWordRecognitionRef.current.onend = () => {
-        // Restart wake word detection if it ends and we're still in wake word mode
-        if (isListeningForWakeWord) {
-          console.log("Wake word detection ended, restarting...")
-          wakeWordRecognitionRef.current?.start()
-        }
-      }
+		commandRecognitionRef.current.onresult = (event) => {
+			const transcript = event.results[0][0].transcript.toLowerCase().trim();
+			setLastCommand(transcript);
+			// No local command processing — backend handles it
+		};
 
-      wakeWordRecognitionRef.current.onerror = (event) => {
-        console.error("Wake word detection error:", event.error)
-        // Don't set error state for "no-speech" errors as they're common
-        if (event.error !== "no-speech") {
-          setError(`Wake word detection error: ${event.error}`)
-        }
+		commandRecognitionRef.current.onend = () => {
+			isCommandRecognitionRunningRef.current = false;
+			isStartingCommandRecognitionRef.current = false;
+			if (isVoiceCommandActive) {
+				setTimeout(() => {
+					if (!isCommandRecognitionRunningRef.current && !isStartingCommandRecognitionRef.current) {
+						commandRecognitionRef.current?.start();
+					}
+				}, 200);
+			}
+		};
 
-        // Restart wake word detection on error
-        if (isListeningForWakeWord) {
-          setTimeout(() => {
-            wakeWordRecognitionRef.current?.start()
-          }, 100)
-        }
-      }
+		commandRecognitionRef.current.onerror = (event) => {
+			isCommandRecognitionRunningRef.current = false;
+			isStartingCommandRecognitionRef.current = false;
+			if (event.error !== "no-speech") setError(`Command error: ${event.error}`);
+			if (isVoiceCommandActive) {
+				setTimeout(() => {
+					if (!isCommandRecognitionRunningRef.current && !isStartingCommandRecognitionRef.current) {
+						commandRecognitionRef.current?.start();
+					}
+				}, 100000000000);
+			}
+		};
 
-      wakeWordRecognitionRef.current.start()
-      setIsListeningForWakeWord(true)
-      setError(null)
-    } catch (err) {
-      console.error("Error starting wake word detection:", err)
-      setError("Failed to start wake word detection")
-    }
-  }, [isListeningForWakeWord])
+		commandRecognitionRef.current.start();
+		setIsVoiceCommandActive(true);
+	}, [isVoiceCommandActive]);
 
-  // Function to stop wake word detection
-  const stopWakeWordDetection = useCallback(() => {
-    if (!wakeWordRecognitionRef.current) return
+	const stopCommandRecognition = useCallback(() => {
+		if (!commandRecognitionRef.current) return;
+		commandRecognitionRef.current.stop();
+		setIsVoiceCommandActive(false);
+		isCommandRecognitionRunningRef.current = false;
+		isStartingCommandRecognitionRef.current = false;
+	}, []);
 
-    try {
-      wakeWordRecognitionRef.current.stop()
-      setIsListeningForWakeWord(false)
-    } catch (err) {
-      console.error("Error stopping wake word detection:", err)
-    }
-  }, [])
+	const startStreaming = async () => {
+		try {
+			const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+			const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+			sampleRateRef.current = audioContext.sampleRate;
+			const source = audioContext.createMediaStreamSource(stream);
+			const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+			const socket = new WebSocket("ws://127.0.0.1:8000/ws/grab_buddy");
+			socket.binaryType = "arraybuffer";
 
-  // Function to start command recognition
-  const startCommandRecognition = useCallback(() => {
-    if (!commandRecognitionRef.current) return
+			processor.onaudioprocess = (e) => {
+				if (isTTSSpeakingRef.current) return;
+				const inputBuffer = e.inputBuffer.getChannelData(0);
+				const buffer44100Hz = new Float32Array(inputBuffer);
+				const originalSampleRate = audioContext.sampleRate;
+				const targetSampleRate = 16000;
 
-    try {
-      commandRecognitionRef.current.onresult = (event) => {
-        const transcript = event.results[0][0].transcript.toLowerCase().trim()
-        console.log("Command recognition heard:", transcript)
-        setLastCommand(transcript)
+				if (originalSampleRate !== targetSampleRate) {
+					const offlineCtx = new OfflineAudioContext(
+						1,
+						inputBuffer.length * (targetSampleRate / originalSampleRate),
+						targetSampleRate
+					);
+					const bufferSource = offlineCtx.createBufferSource();
+					const audioBuffer = offlineCtx.createBuffer(1, inputBuffer.length, originalSampleRate);
+					audioBuffer.copyToChannel(inputBuffer, 0);
+					bufferSource.buffer = audioBuffer;
+					bufferSource.connect(offlineCtx.destination);
+					bufferSource.start();
 
-        // Process the command
-        processCommand(transcript)
-      }
+					offlineCtx.startRendering().then((renderedBuffer) => {
+						const buffer16000Hz = renderedBuffer.getChannelData(0);
+						handleChunkingAndSend(buffer16000Hz, socket, targetSampleRate);
+					});
+				} else {
+					handleChunkingAndSend(buffer44100Hz, socket, sampleRateRef.current);
+				}
+			};
 
-      commandRecognitionRef.current.onend = () => {
-        // If voice commands are still active, restart command recognition
-        if (isVoiceCommandActive) {
-          console.log("Command recognition ended, restarting...")
-          setTimeout(() => {
-            commandRecognitionRef.current?.start()
-          }, 100)
-        }
-      }
+			socket.onopen = () => {
+				source.connect(processor);
+				processor.connect(audioContext.destination);
+				socketRef.current = socket;
+				audioContextRef.current = audioContext;
+				processorRef.current = processor;
+				sourceRef.current = source;
+			};
 
-      commandRecognitionRef.current.onerror = (event) => {
-        console.error("Command recognition error:", event.error)
-        if (event.error !== "no-speech") {
-          setError(`Command recognition error: ${event.error}`)
-        }
+			socket.onmessage = (event) => {
+				console.log("WebSocket message received:", event.data);
+				if (typeof event.data === "string") {
+					try {
+						const message = JSON.parse(event.data);
+						if (message.type === "state_update") {
+							const { driverStatus: newDriverStatus, rideStatus: newRideStatus } = message.payload;
 
-        // Restart command recognition on error if still active
-        if (isVoiceCommandActive) {
-          setTimeout(() => {
-            commandRecognitionRef.current?.start()
-          }, 100)
-        }
-      }
+							console.log(newDriverStatus);
 
-      commandRecognitionRef.current.start()
-      setIsVoiceCommandActive(true)
-    } catch (err) {
-      console.error("Error starting command recognition:", err)
-      setError("Failed to start command recognition")
-    }
-  }, [isVoiceCommandActive])
+							// Handle driver status change
+							if (newDriverStatus) {
+								if (newDriverStatus === "ONLINE") {
+									toggleDriverStatus();
+								} else if (newDriverStatus === "OFFLINE") {
+toggleDriverStatus();
+								}
+							}
 
-  // Function to stop command recognition
-  const stopCommandRecognition = useCallback(() => {
-    if (!commandRecognitionRef.current) return
+							// Handle ride status change
+							if (newRideStatus) {
+								switch (newRideStatus) {
+									case "ACCEPTED":
+										acceptRide();
+										break;
+									case "DECLINED":
+										declineRide();
+										break;
+									case "STARTED":
+										startRide();
+										break;
+									case "ENDED":
+										endRide();
+										break;
+									default:
+										break;
+								}
+							}
+						}
+					} catch (e) {
+						console.warn("Non-JSON message received:", event.data);
+					}
+					return;
+				}
 
-    try {
-      commandRecognitionRef.current.stop()
-      setIsVoiceCommandActive(false)
-    } catch (err) {
-      console.error("Error stopping command recognition:", err)
-    }
-  }, [])
+				// Handle audio playback
+				const arrayBuffer = event.data;
+				if (!audioContextRef.current) return;
+				audioContextRef.current.decodeAudioData(arrayBuffer.slice(0), (decodedData) => {
+					const source = audioContextRef.current!.createBufferSource();
+					isPlayingRef.current = true;
+					isTTSSpeakingRef.current = true;
+					source.buffer = decodedData;
+					source.connect(audioContextRef.current.destination);
+					source.start();
+					source.onended = () => {
+						isPlayingRef.current = false;
+						isTTSSpeakingRef.current = false;
+						playbackCountRef.current++;
+						if (playbackCountRef.current >= 2) stopStreaming();
+					};
+				});
+			};
 
-  // Function to process voice commands - SIMPLIFIED to just online/offline
-  const processCommand = useCallback(
-    (command: string) => {
-      console.log("Processing command:", command)
+			socket.onclose = () => {
+				isPlayingRef.current = false;
+				isTTSSpeakingRef.current = false;
+				stopCommandRecognition();
+				startWakeWordDetection();
+				stopStreaming();
+			};
 
-      // Handle deactivation commands
-      if (
-        command.includes("bye grab") ||
-        command.includes("buy grab") ||
-        command.includes("goodbye grab") ||
-        command.includes("stop listening") ||
-        command.includes("turn off voice commands")
-      ) {
-        speakFeedback("Voice commands deactivated")
-        stopCommandRecognition()
-        startWakeWordDetection()
-        return
-      }
+			socket.onerror = () => {
+				isPlayingRef.current = false;
+				isTTSSpeakingRef.current = false;
+				stopCommandRecognition();
+				startWakeWordDetection();
+				stopStreaming();
+			};
+		} catch (err) {
+			console.error("Streaming error:", err);
+		}
+	};
 
-      // Handle driver status commands - ONLY THESE COMMANDS ARE KEPT
-      if (command.includes("go online")) {
-        if (driverStatus === DriverStatus.OFFLINE) {
-          toggleDriverStatus()
-          speakFeedback("Going online")
-        } else {
-          speakFeedback("You are already online")
-        }
-      } else if (command.includes("go offline")) {
-        if (driverStatus === DriverStatus.ONLINE) {
-          toggleDriverStatus()
-          speakFeedback("Going offline")
-        } else {
-          speakFeedback("You are already offline")
-        }
-      }
-      // Handle help command
-      else if (command.includes("help") || command.includes("what can you do")) {
-        speakFeedback("Available commands include: go online and go offline")
-      }
-      // Unknown command
-      else {
-        speakFeedback(
-          "Sorry, I didn't understand that command. You can say go online, go offline, or bye grab to exit.",
-        )
-      }
-    },
-    [driverStatus, toggleDriverStatus, stopCommandRecognition, startWakeWordDetection],
-  )
+	const handleChunkingAndSend = (buffer: Float32Array, socket: WebSocket, sampleRate: number) => {
+		audioBufferRef.current.push(buffer);
+		accumulatedSamplesRef.current += buffer.length;
+		const samplesNeeded = sampleRate * chunkDuration;
 
-  // Function to provide audio feedback
-  const speakFeedback = useCallback((text: string) => {
-    if ("speechSynthesis" in window) {
-      const utterance = new SpeechSynthesisUtterance(text)
-      utterance.rate = 1.0
-      utterance.pitch = 1.0
-      utterance.volume = 1.0
-      window.speechSynthesis.speak(utterance)
-    }
-  }, [])
+		if (accumulatedSamplesRef.current >= samplesNeeded) {
+			const combinedBuffer = new Float32Array(samplesNeeded);
+			let offset = 0;
+			let remaining = samplesNeeded;
 
-  // Function to manually activate voice commands (for testing)
-  const activateVoiceCommands = useCallback(() => {
-    if (isVoiceCommandActive) {
-      // If already active, deactivate
-      speakFeedback("Voice commands deactivated")
-      stopCommandRecognition()
-      startWakeWordDetection()
-    } else {
-      // If not active, activate
-      stopWakeWordDetection()
-      startCommandRecognition()
-      speakFeedback("Voice commands activated. How can I help?")
-    }
-  }, [
-    isVoiceCommandActive,
-    stopWakeWordDetection,
-    startCommandRecognition,
-    stopCommandRecognition,
-    startWakeWordDetection,
-    speakFeedback,
-  ])
+			while (remaining > 0 && audioBufferRef.current.length > 0) {
+				const current = audioBufferRef.current[0];
+				const toCopy = Math.min(current.length, remaining);
+				combinedBuffer.set(current.subarray(0, toCopy), offset);
+				offset += toCopy;
+				remaining -= toCopy;
 
-  return {
-    isSupported,
-    isListeningForWakeWord,
-    isVoiceCommandActive,
-    lastCommand,
-    error,
-    activateVoiceCommands,
-  }
+				if (toCopy === current.length) {
+					audioBufferRef.current.shift();
+				} else {
+					audioBufferRef.current[0] = current.subarray(toCopy);
+				}
+			}
+
+			accumulatedSamplesRef.current = audioBufferRef.current.reduce((acc, buf) => acc + buf.length, 0);
+			if (socket.readyState === WebSocket.OPEN) {
+				socket.send(combinedBuffer.buffer);
+			}
+		}
+	};
+
+	const stopStreaming = () => {
+		if (isPlayingRef.current || isTTSSpeakingRef.current) return;
+		processorRef.current?.disconnect();
+		sourceRef.current?.disconnect();
+		if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+			audioContextRef.current.close();
+		}
+		audioContextRef.current = null;
+		socketRef.current?.close();
+		socketRef.current = null;
+		audioBufferRef.current = [];
+		accumulatedSamplesRef.current = 0;
+		playbackCountRef.current = 0;
+	};
+
+	return {
+		isSupported,
+		isListeningForWakeWord,
+		isVoiceCommandActive,
+		lastCommand,
+		error,
+	};
 }
