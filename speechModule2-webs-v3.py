@@ -506,6 +506,9 @@ def handle_intent_and_get_response(intent_result, chat_history):
                 response_parts.append(get_weather_info())
             if "traffic_info" in intents:
                 response_parts.append(get_traffic_info())
+            if "emergency" in intents:
+                response_parts.append(
+                    "Grab is notified of this issue and it is being looked at.")
             if "directions" in intents:
                 destination_for_directions = intent_result["parameters"].get(
                     "directions_parameters", {}).get("destination")
